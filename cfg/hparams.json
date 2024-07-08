@@ -1,0 +1,309 @@
+{
+  "device": "cuda",
+  "dtype": "float32",
+  "autocast": true,
+  "autocast_dtype": "float16",
+  "seed": 2036,
+  "show": false,
+  "generate_only": false,
+  "execute_only": null,
+  "execute_best": false,
+  "execute_inplace": false,
+  "label": "300M_fvdata",
+  "logging": {
+    "level": "INFO",
+    "log_updates": 10,
+    "log_tensorboard": true,
+    "log_wandb": true
+  },
+  "tensorboard": { "with_media_logging": false, "name": null, "sub_dir": null },
+  "wandb": {
+    "with_media_logging": true,
+    "project": "MAGNeT_NV_",
+    "name": "spanlen_3_scds_context_5_30secs_300M_fvdata",
+    "group": null
+  },
+  "slurm": {
+    "gpus": 4,
+    "mem_per_gpu": 40,
+    "time": 3600,
+    "constraint": "volta32gb",
+    "partition": "learnlab",
+    "comment": null,
+    "setup": ["module load cudnn/v8.0.3.33-cuda.11.0 NCCL/2.8.3-1-cuda.11.0"],
+    "exclude": ""
+  },
+  "dora": {
+    "dir": "experiments/magma/outputs",
+    "exclude": [
+      "device",
+      "wandb.*",
+      "tensorboard.*",
+      "logging.*",
+      "data.num_workers",
+      "eval.num_workers",
+      "special.*",
+      "metrics.visqol.bin",
+      "generate_only",
+      "execute_only",
+      "execute_best",
+      "generate.every",
+      "optim.eager_sync",
+      "profiler.*",
+      "deadlock.*"
+    ],
+    "use_rendezvous": false,
+    "git_save": true
+  },
+  "datasource": { "max_sample_rate": 32000, "max_channels": 1 },
+  "solver": "lm",
+  "fsdp": {
+    "use": false,
+    "param_dtype": "float16",
+    "reduce_dtype": "float32",
+    "buffer_dtype": "float32",
+    "sharding_strategy": "shard_grad_op",
+    "per_block": true
+  },
+  "profiler": { "enabled": false },
+  "deadlock": { "use": true, "timeout": 240 },
+  "checkpoint": {
+    "continue_from": null,
+    "continue_best": false,
+    "save_last": true,
+    "save_best": false,
+    "save_every": 50,
+    "keep_last": 10,
+    "keep_every_states": null
+  },
+  "dataset": {
+    "batch_size": 192,
+    "num_workers": 10,
+    "segment_duration": 30,
+    "num_samples": null,
+    "return_info": true,
+    "shuffle": false,
+    "sample_on_duration": false,
+    "sample_on_weight": false,
+    "min_segment_ratio": 0.8,
+    "train": { "num_samples": 1000000, "shuffle": true },
+    "valid": { "num_samples": 10000 },
+    "evaluate": { "num_samples": 10000 },
+    "generate": {
+      "num_samples": 50,
+      "return_info": true,
+      "batch_size": "${dataset.batch_size}"
+    },
+    "merge_text_p": 0.25,
+    "drop_desc_p": 0.5
+  },
+  "valid": { "every": 1 },
+  "generate": {
+    "every": 1000,
+    "path": "samples",
+    "audio": { "format": "mp3", "strategy": "rms" },
+    "lm": {
+      "unconditional_samples": 1,
+      "max_prompt_len": null,
+      "max_gen_len": null,
+      "use_sampling": true,
+      "temp": 3.0,
+      "top_k": 250,
+      "top_p": 0.9,
+      "remove_prompts": false,
+      "samples": { "prompted": true, "unprompted": true },
+      "timesteps": [20, 10, 10, 10],
+      "temperature_anneal": true,
+      "max_clsfg_coef": 10.0,
+      "min_clsfg_coef": 1.0,
+      "anneal_clsfg": true,
+      "lps_masking": false,
+      "remask": false,
+      "span_scoring": "max",
+      "w_span_lm": 0.0,
+      "tempr_schedule": "linear"
+    },
+    "num_workers": 5,
+    "rescorer_ckpt": "",
+    "rescorer_scale": "large"
+  },
+  "evaluate": {
+    "every": 25,
+    "num_workers": 5,
+    "truncate_audio": null,
+    "fixed_generation_duration": null,
+    "metrics": {
+      "base": true,
+      "visqol": false,
+      "sisnr": false,
+      "fad": false,
+      "kld": false,
+      "text_consistency": false,
+      "chroma_cosine": false
+    }
+  },
+  "metrics": {
+    "visqol": {
+      "mode": "audio",
+      "bin": null,
+      "model": "tcdaudio14_aacvopus_coresv_svrnsim_n.68_g.01_c1.model"
+    },
+    "fad": {
+      "use_encoded_audio": false,
+      "model": "tf",
+      "tf": {
+        "model_path": "//reference/fad/vggish_model.ckpt",
+        "batch_size": 8
+      }
+    },
+    "kld": {
+      "use_encoded_audio": false,
+      "model": "passt",
+      "passt": { "pretrained_length": 20 },
+      "sample_cnn": { "model_path": "//reference/sample_cnn/checkpoint.th" }
+    },
+    "chroma_cosine": {
+      "sample_rate": 32000,
+      "n_chroma": 12,
+      "radix2_exp": 14,
+      "argmax": true
+    },
+    "text_consistency": {
+      "use_gt": false,
+      "model": "clap",
+      "clap": { "model_arch": "HTSAT-base", "enable_fusion": false }
+    }
+  },
+  "optim": {
+    "epochs": 500,
+    "updates_per_epoch": 2000,
+    "lr": 0.0001,
+    "optimizer": "adamw",
+    "adam": { "betas": [0.9, 0.95], "weight_decay": 0.1, "eps": 1e-8 },
+    "ema": { "use": true, "updates": 10, "device": "cuda", "decay": 0.99 },
+    "max_norm": 1.0,
+    "eager_sync": true
+  },
+  "schedule": {
+    "lr_scheduler": "cosine",
+    "step": { "step_size": null, "gamma": null },
+    "exponential": { "lr_decay": null },
+    "cosine": { "warmup": 4000, "lr_min_ratio": 0.0, "cycle_length": 1.0 },
+    "polynomial_decay": {
+      "warmup": null,
+      "zero_lr_warmup_steps": 0,
+      "end_lr": 0.0,
+      "power": 1
+    },
+    "inverse_sqrt": { "warmup": null, "warmup_init_lr": 0.0 },
+    "linear_warmup": { "warmup": null, "warmup_init_lr": 0.0 }
+  },
+  "l1": {},
+  "l2": {},
+  "mrstft": { "factor_sc": 0.5, "factor_mag": 0.5, "normalized": false },
+  "mel": {
+    "sample_rate": "${sample_rate}",
+    "n_fft": 1024,
+    "hop_length": 256,
+    "win_length": 1024,
+    "n_mels": 64,
+    "f_min": 64,
+    "f_max": null,
+    "normalized": false,
+    "floor_level": 1e-5
+  },
+  "sisnr": { "sample_rate": "${sample_rate}", "segment": 5.0 },
+  "msspec": {
+    "sample_rate": "${sample_rate}",
+    "range_start": 6,
+    "range_end": 11,
+    "n_mels": 64,
+    "f_min": 64,
+    "f_max": null,
+    "normalized": false,
+    "alphas": true,
+    "floor_level": 1e-5
+  },
+  "classifier_free_guidance": {
+    "training_dropout": 0.3,
+    "inference_coef": 3.0
+  },
+  "attribute_dropout": {},
+  "fuser": {
+    "cross_attention_pos_emb": false,
+    "cross_attention_pos_emb_scale": 1,
+    "sum": [],
+    "prepend": [],
+    "cross": ["description"],
+    "input_interpolate": []
+  },
+  "conditioners": {
+    "args": { "merge_text_conditions_p": 0.25, "drop_desc_p": 0.5 },
+    "description": {
+      "model": "t5",
+      "t5": {
+        "name": "t5-base",
+        "finetune": false,
+        "word_dropout": 0.3,
+        "normalize_text": false
+      }
+    }
+  },
+  "sample_rate": 32000,
+  "channels": 1,
+  "flatten_codebooks": {
+    "use": false,
+    "codebooks_per_step": 1,
+    "extend_cardinality": true
+  },
+  "tokens": { "swap_silence_with_padding": false },
+  "lm_model": "transformer_lm_magnet",
+  "codebooks_pattern": {
+    "modeling": "parallel",
+    "delay": { "delays": [0, 1, 2, 3], "flatten_first": 0, "empty_initial": 0 },
+    "unroll": { "flattening": [0, 1, 2, 3], "delays": [0, 0, 0, 0] },
+    "music_lm": { "group_by": 2 },
+    "valle": { "delays": [0, 0, 0] },
+    "parallel": { "empty_initial": -1 }
+  },
+  "transformer_lm": {
+    "dim": 1024,
+    "num_heads": 16,
+    "num_layers": 24,
+    "hidden_scale": 4,
+    "n_q": 4,
+    "q_modeling": "parallel",
+    "card": 2048,
+    "dropout": 0.0,
+    "emb_lr": null,
+    "activation": "gelu",
+    "norm_first": true,
+    "bias_ff": false,
+    "bias_attn": false,
+    "bias_proj": false,
+    "past_context": null,
+    "causal": false,
+    "custom": false,
+    "memory_efficient": true,
+    "attention_as_float32": false,
+    "layer_scale": null,
+    "positional_embedding": "sin",
+    "xpos": false,
+    "checkpointing": "none",
+    "weight_init": "gaussian",
+    "depthwise_init": "current",
+    "zero_bias_init": true,
+    "norm": "layer_norm",
+    "cross_attention": false,
+    "qk_layer_norm": false,
+    "qk_layer_norm_cross": false,
+    "attention_dropout": null,
+    "kv_repeat": 1,
+    "two_step_cfg": false,
+    "subcodes_context": 5,
+    "compression_model_framerate": -1,
+    "segment_duration": 0
+  },
+  "loss": { "use_unmasked": 0, "stage0_extra_weight": false },
+  "masking": { "span_len": 3 }
+}
