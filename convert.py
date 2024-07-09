@@ -29,6 +29,8 @@ def parse_hparams(state_dict, writer: GGUFWriter, use_f16: bool):
     writer.add_int32("params.n_q", transformer_hparams["n_q"])
     writer.add_int32("params.card", transformer_hparams["card"])
     writer.add_int32("params.hidden_scale", transformer_hparams["hidden_scale"])
+    writer.add_int32("params.kv_repeat", transformer_hparams["kv_repeat"])
+    writer.add_int32("params.subcodes_context", transformer_hparams["subcodes_context"])
     writer.add_int32("params.sample_rate", 32000)
 
     # TODO: add the default params for generation (key: "lm")

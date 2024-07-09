@@ -11,6 +11,8 @@ struct magnet_hparams {
     int32_t n_q = 4;
     int32_t kv_repeat = 1;
     int32_t card = 2048;
+    int32_t subcodes_context = 5;
+    int32_t sample_rate = 32000;
 };
 
 struct magnet_transformer_block {
@@ -80,11 +82,6 @@ struct magnet_context {
     magnet_model model;
 };
 
-template<typename T>
-static void read_safe(std::ifstream &infile, T &dest) {
-    infile.read((char*)&dest, sizeof(T));
-}
-
 static void ggml_log_callback_default(ggml_log_level level, const char *text, void *user_data) {
     (void)level;
     (void)user_data;
@@ -93,16 +90,79 @@ static void ggml_log_callback_default(ggml_log_level level, const char *text, vo
 }
 
 #define MAGNET_INFILE_MAGIC 0x46554747 // 'GGUF' LE
+#define GGUF_GET_I32(ctx, key) gguf_get_val_i32(ctx, gguf_find_key(ctx, key))
 
 bool load_parameters(std::string& file_name, magnet_model &model) {
+    // Load le model
+    {
+        struct ggml_init_params params = {
+            .mem_size = 0,
+            .mem_buffer = NULL
+        };
+
+        struct ggml_context* ctx = ggml_init(params);
+        if(ctx == nullptr) {
+            fprintf(stderr, "%s: Failed to initialize ggml\n", __func__);
+            return false;
+        }
+        model.ctx = ctx;
+
+        // Now try to init from the file
+        struct gguf_init_params gguf_params {
+            .no_alloc = false,
+            .ctx = &ctx,
+        };
+
+        struct gguf_context* gguf_ctx = gguf_init_from_file(file_name.c_str(), gguf_params);
+        if(gguf_ctx == nullptr) {
+            fprintf(stderr, "%s: Failed to load gguf file\n", __func__);
+            return false;
+        }
+        int n_keys = gguf_get_n_kv(gguf_ctx);
+        printf("num of keys: %d\n", n_keys);
+        int n_tensors = gguf_get_n_tensors(gguf_ctx);
+        printf("num of tensors: %d\n", n_tensors);
+
+        model.hparams.dim = GGUF_GET_I32(gguf_ctx, "params.dim");
+        model.hparams.num_heads = GGUF_GET_I32(gguf_ctx, "params.num_heads");
+        model.hparams.num_layers = GGUF_GET_I32(gguf_ctx, "params.num_layers");
+        model.hparams.hidden_scale = GGUF_GET_I32(gguf_ctx, "params.hidden_scale");
+        model.hparams.n_q = GGUF_GET_I32(gguf_ctx, "params.n_q");
+        model.hparams.kv_repeat = GGUF_GET_I32(gguf_ctx, "params.kv_repeat");
+        model.hparams.card = GGUF_GET_I32(gguf_ctx, "params.card");
+        model.hparams.subcodes_context = GGUF_GET_I32(gguf_ctx, "params.subcodes_context");
+        model.hparams.sample_rate = GGUF_GET_I32(gguf_ctx, "params.sample_rate");
+
+        printf("Model Hyperparameters\n");
+        printf("dim:                %d\n", model.hparams.dim);
+        printf("num_heads:          %d\n", model.hparams.num_heads);
+        printf("num_layers:         %d\n", model.hparams.num_layers);
+        printf("hidden_scale:       %d\n", model.hparams.hidden_scale);
+        printf("n_q:                %d\n", model.hparams.n_q);
+        printf("kv_repeat:          %d\n", model.hparams.kv_repeat);
+        printf("card:               %d\n", model.hparams.card);
+        printf("subcodes_context:   %d\n", model.hparams.subcodes_context);
+        printf("sample_rate:        %d\n", model.hparams.sample_rate);
+
+        struct ggml_tensor* tensor = ggml_get_first_tensor(ctx);
+        while(tensor != nullptr) {
+            int dims = ggml_n_dims(tensor);
+            const char* name = ggml_get_name(tensor);
+            const char* type_name = ggml_type_name(tensor->type);
+            printf("%s (%d) (%s)\n", name, dims, type_name);
+
+            tensor = ggml_get_next_tensor(ctx, tensor);
+        }
+
+        gguf_free(gguf_ctx);
+    }
+
     // Calculate the size in memory of the tensors for the context
     // Guess that this is useless now that I'm just using the builtin GGUF functions
-    int ctx_size = 0;
+    size_t ctx_size = 0;
     {
         auto& hparams = model.hparams;
 
-
-        // TODO: read in the hyperparams from the GGUF file
         auto n_q = hparams.n_q;
         auto input_dim = hparams.dim;
         auto num_heads = hparams.num_heads;
@@ -173,48 +233,6 @@ bool load_parameters(std::string& file_name, magnet_model &model) {
         printf("Estimated size (MB): %6.2f\n", ctx_size / (1024.0 * 1024.0));
     }
 
-    {
-        struct ggml_init_params params = {
-            .mem_size = ctx_size,
-            .mem_buffer = NULL
-        };
-
-        struct ggml_context* ctx = ggml_init(params);
-        if(ctx == nullptr) {
-            fprintf(stderr, "%s: Failed to initialize ggml\n", __func__);
-            return false;
-        }
-        model.ctx = ctx;
-
-        // Now try to init from the file
-        struct gguf_init_params gguf_params {
-            .no_alloc = false,
-            .ctx = &ctx,
-        };
-
-        struct gguf_context* gguf_ctx = gguf_init_from_file(file_name.c_str(), gguf_params);
-        if(gguf_ctx == nullptr) {
-            fprintf(stderr, "%s: Failed to load gguf file\n", __func__);
-            return false;
-        }
-        int n_keys = gguf_get_n_kv(gguf_ctx);
-        printf("num of keys: %d\n", n_keys);
-        int n_tensors = gguf_get_n_tensors(gguf_ctx);
-        printf("num of tensors: %d\n", n_tensors);
-
-        gguf_free(gguf_ctx);
-
-        struct ggml_tensor* tensor = ggml_get_first_tensor(ctx);
-        while(tensor != nullptr) {
-            int dims = ggml_n_dims(tensor);
-            const char* name = ggml_get_name(tensor);
-            const char* type_name = ggml_type_name(tensor->type);
-            printf("%s (%d) (%s)\n", name, dims, type_name);
-
-            tensor = ggml_get_next_tensor(ctx, tensor);
-        }
-    }
-
     return true;
 }
 
@@ -227,6 +245,9 @@ int main(int argc, char** argv) {
     std::string file_name = "C:\\Users\\drew\\project\\magnet.cpp\\mdl\\ggml_model.bin";
 
     load_parameters(file_name, ctx->model);
+
+    //FIXME: remove
+    system("pause");
 
     ggml_free(ctx->model.ctx);
     delete ctx;
