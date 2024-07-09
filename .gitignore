@@ -35,3 +35,4 @@ build/
 state_dict.bin
 compression_state_dict.bin
 ggml_model.bin
+.vscode/
