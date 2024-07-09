@@ -73,11 +73,10 @@ struct magnet_model {
     struct ggml_tensor* linear3_w;
 
     magnet_hparams hparams;
+    struct ggml_context* ctx;
 };
 
 struct magnet_context {
-    struct ggml_context* ctx;
-
     magnet_model model;
 };
 
@@ -95,24 +94,15 @@ static void ggml_log_callback_default(ggml_log_level level, const char *text, vo
 
 #define MAGNET_INFILE_MAGIC 0x46554747 // 'GGUF' LE
 
-bool load_parameters(std::ifstream& in_file, magnet_model &model) {
-    {
-        uint32_t magic;
-        read_safe(in_file, magic);
-        if(magic != MAGNET_INFILE_MAGIC) {
-            fprintf(stderr, "%s: invalid model file (bad magic)\n", __func__);
-            in_file.close();
-            return false;
-        }
-    }
-
-    printf("reached!\n");
-
+bool load_parameters(std::string& file_name, magnet_model &model) {
     // Calculate the size in memory of the tensors for the context
+    // Guess that this is useless now that I'm just using the builtin GGUF functions
     int ctx_size = 0;
     {
         auto& hparams = model.hparams;
 
+
+        // TODO: read in the hyperparams from the GGUF file
         auto n_q = hparams.n_q;
         auto input_dim = hparams.dim;
         auto num_heads = hparams.num_heads;
@@ -182,25 +172,64 @@ bool load_parameters(std::ifstream& in_file, magnet_model &model) {
         }
         printf("Estimated size (MB): %6.2f\n", ctx_size / (1024.0 * 1024.0));
     }
+
+    {
+        struct ggml_init_params params = {
+            .mem_size = ctx_size,
+            .mem_buffer = NULL
+        };
+
+        struct ggml_context* ctx = ggml_init(params);
+        if(ctx == nullptr) {
+            fprintf(stderr, "%s: Failed to initialize ggml\n", __func__);
+            return false;
+        }
+        model.ctx = ctx;
+
+        // Now try to init from the file
+        struct gguf_init_params gguf_params {
+            .no_alloc = false,
+            .ctx = &ctx,
+        };
+
+        struct gguf_context* gguf_ctx = gguf_init_from_file(file_name.c_str(), gguf_params);
+        if(gguf_ctx == nullptr) {
+            fprintf(stderr, "%s: Failed to load gguf file\n", __func__);
+            return false;
+        }
+        int n_keys = gguf_get_n_kv(gguf_ctx);
+        printf("num of keys: %d\n", n_keys);
+        int n_tensors = gguf_get_n_tensors(gguf_ctx);
+        printf("num of tensors: %d\n", n_tensors);
+
+        gguf_free(gguf_ctx);
+
+        struct ggml_tensor* tensor = ggml_get_first_tensor(ctx);
+        while(tensor != nullptr) {
+            int dims = ggml_n_dims(tensor);
+            const char* name = ggml_get_name(tensor);
+            const char* type_name = ggml_type_name(tensor->type);
+            printf("%s (%d) (%s)\n", name, dims, type_name);
+
+            tensor = ggml_get_next_tensor(ctx, tensor);
+        }
+    }
+
     return true;
 }
 
 int main(int argc, char** argv) {
     printf("Hello world!\n");
 
-    magnet_model model;
+    magnet_context *ctx = new magnet_context();
+    ctx->model = magnet_model();
 
     std::string file_name = "C:\\Users\\drew\\project\\magnet.cpp\\mdl\\ggml_model.bin";
-    std::ifstream in_file(file_name, std::ios::in|std::ios::binary|std::ios::ate);
-    if(!in_file.is_open()) {
-        fprintf(stderr, "%s: could not open file %s\n", __func__, file_name);
-        return false;
-    }
 
-    in_file.seekg(0, std::ios::beg);
+    load_parameters(file_name, ctx->model);
 
-    load_parameters(in_file, model);
+    ggml_free(ctx->model.ctx);
+    delete ctx;
 
-    in_file.close();
     return 0;
 }
