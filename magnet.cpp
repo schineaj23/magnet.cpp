@@ -318,12 +318,45 @@ bool load_parameters(std::string& file_name, magnet_model& model)
     return true;
 }
 
+// 2.1) Normalize (LayerNorm https://arxiv.org/pdf/1607.06450)
+ggml_tensor* layer_norm_forward(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x)
+{
+    // layernorm = ((weight / std deviation of layer) * (input - mean)) + bias
+    ggml_tensor* mean = ggml_mean(ctx, x);
+    ggml_tensor* error = ggml_sub(ctx, x, mean);
+    ggml_tensor* variance = ggml_mean(ctx, ggml_sqr(ctx, error));
+    ggml_tensor* std_dev = ggml_sqrt(ctx, variance);
+
+    ggml_tensor* out = ggml_add(ctx, ggml_mul_mat(ctx, ggml_div(ctx, w, std_dev), error), b);
+    return out;
+}
+
+ggml_tensor* magnet_transformer_block_forward(ggml_context* ctx, magnet_transformer_block* block, ggml_tensor* x)
+{
+    // 2.1) Normalize (LayerNorm https://arxiv.org/pdf/1607.06450)
+    x = layer_norm_forward(ctx, block->layer_norm1_w, block->layer_norm1_b, x);
+    // 2.2) Self attention (use Flash Attention, see paper https://arxiv.org/abs/2205.14135)
+    // 2.3) Cross attn normalization (LayerNorm)
+    // 2.4) Cross attention
+    // 2.5) Feedforward block (linears)
+    // 2.6) Normalize (LayerNorm)
+
+    return x;
+}
+
+ggml_tensor* magnet_transformer_forward(magnet_model* model, ggml_tensor* x)
+{
+    // 1) Create position embeddings (MAGNeT uses sine embeddings)
+    // 2) Apply each transformer Layer
+    return nullptr;
+}
+
 int main(int argc, char** argv)
 {
     magnet_context* ctx = new magnet_context();
     ctx->model = magnet_model();
 
-    std::string file_name = "C:\\Users\\drew\\project\\magnet.cpp\\mdl\\medium\\ggml_model.bin";
+    std::string file_name = "C:\\Users\\drew\\project\\magnet.cpp\\mdl\\small\\ggml_model.bin";
 
     load_parameters(file_name, ctx->model);
 
