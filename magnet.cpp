@@ -1,7 +1,7 @@
+#include "ggml.h"
+#include <fstream>
 #include <stdio.h>
 #include <vector>
-#include <fstream>
-#include "ggml.h"
 
 struct magnet_hparams {
     int32_t dim = 1024;
@@ -82,7 +82,8 @@ struct magnet_context {
     magnet_model model;
 };
 
-static void ggml_log_callback_default(ggml_log_level level, const char *text, void *user_data) {
+static void ggml_log_callback_default(ggml_log_level level, const char* text, void* user_data)
+{
     (void)level;
     (void)user_data;
     fputs(text, stderr);
@@ -92,7 +93,8 @@ static void ggml_log_callback_default(ggml_log_level level, const char *text, vo
 #define MAGNET_INFILE_MAGIC 0x46554747 // 'GGUF' LE
 #define GGUF_GET_I32(ctx, key) gguf_get_val_i32(ctx, gguf_find_key(ctx, key))
 
-bool load_parameters(std::string& file_name, magnet_model &model) {
+bool load_parameters(std::string& file_name, magnet_model& model)
+{
     // Load le model
     {
         struct ggml_init_params params = {
@@ -100,28 +102,29 @@ bool load_parameters(std::string& file_name, magnet_model &model) {
             .mem_buffer = NULL
         };
 
-        struct ggml_context* ctx = ggml_init(params);
-        if(ctx == nullptr) {
+        model.ctx = ggml_init(params);
+        if (model.ctx == nullptr) {
             fprintf(stderr, "%s: Failed to initialize ggml\n", __func__);
             return false;
         }
-        model.ctx = ctx;
 
         // Now try to init from the file
         struct gguf_init_params gguf_params {
             .no_alloc = false,
-            .ctx = &ctx,
+            .ctx = &model.ctx,
         };
 
         struct gguf_context* gguf_ctx = gguf_init_from_file(file_name.c_str(), gguf_params);
-        if(gguf_ctx == nullptr) {
+        if (gguf_ctx == nullptr) {
             fprintf(stderr, "%s: Failed to load gguf file\n", __func__);
             return false;
         }
         int n_keys = gguf_get_n_kv(gguf_ctx);
-        printf("num of keys: %d\n", n_keys);
+        printf("Number of keys: %d\n", n_keys);
         int n_tensors = gguf_get_n_tensors(gguf_ctx);
-        printf("num of tensors: %d\n", n_tensors);
+        printf("Number of tensors: %d\n", n_tensors);
+
+        gguf_free(gguf_ctx);
 
         model.hparams.dim = GGUF_GET_I32(gguf_ctx, "params.dim");
         model.hparams.num_heads = GGUF_GET_I32(gguf_ctx, "params.num_heads");
@@ -143,18 +146,6 @@ bool load_parameters(std::string& file_name, magnet_model &model) {
         printf("card:               %d\n", model.hparams.card);
         printf("subcodes_context:   %d\n", model.hparams.subcodes_context);
         printf("sample_rate:        %d\n", model.hparams.sample_rate);
-
-        struct ggml_tensor* tensor = ggml_get_first_tensor(ctx);
-        while(tensor != nullptr) {
-            int dims = ggml_n_dims(tensor);
-            const char* name = ggml_get_name(tensor);
-            const char* type_name = ggml_type_name(tensor->type);
-            printf("%s (%d) (%s)\n", name, dims, type_name);
-
-            tensor = ggml_get_next_tensor(ctx, tensor);
-        }
-
-        gguf_free(gguf_ctx);
     }
 
     // Calculate the size in memory of the tensors for the context
@@ -181,25 +172,25 @@ bool load_parameters(std::string& file_name, magnet_model &model) {
         // FIXME: read the conditioning parameters from the hparams file
         auto conditioning_dim = 768;
         // The T5 model used in this case has an nn.Linear (conditioning_dim, input_dim)
-        ctx_size += conditioning_dim * input_dim * ggml_type_size(GGML_TYPE_F32); // weight
-        ctx_size += input_dim * ggml_type_size(GGML_TYPE_F32); // bias
+        ctx_size += conditioning_dim * input_dim * ggml_type_size(GGML_TYPE_F16); // weight
+        ctx_size += input_dim * ggml_type_size(GGML_TYPE_F16); // bias
 
         // Linear layers for each codebook (input_dim, card)
-        for(int i = 0;i<n_q;i++) {
-            ctx_size += input_dim * card * ggml_type_size(GGML_TYPE_F32);
+        for (int i = 0; i < n_q; i++) {
+            ctx_size += input_dim * card * ggml_type_size(GGML_TYPE_F16);
         }
 
         // Embeddings (nn.Linear)
-        for(int i=0;i<n_q;i++) {
+        for (int i = 0; i < n_q; i++) {
             // emb0-4 (embed_dim, input_dim)
-            ctx_size += embed_dim * input_dim * ggml_type_size(GGML_TYPE_F32);
+            ctx_size += embed_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
         }
 
         // out_norm (nn.LayerNorm) weight & bias = input_dim
-        ctx_size += 2 * input_dim * ggml_type_size(GGML_TYPE_F32);
+        ctx_size += 2 * input_dim * ggml_type_size(GGML_TYPE_F16);
 
         // Transformer Block
-        for(int i=0;i<num_layers;i++) {
+        for (int i = 0; i < num_layers; i++) {
             // First Linear layer (1024, 4096)
             ctx_size += input_dim * dim_feedforward * ggml_type_size(GGML_TYPE_F16);
 
@@ -233,20 +224,110 @@ bool load_parameters(std::string& file_name, magnet_model &model) {
         printf("Estimated size (MB): %6.2f\n", ctx_size / (1024.0 * 1024.0));
     }
 
+    {
+        auto& hparams = model.hparams;
+        ggml_context* ctx = model.ctx;
+        auto n_q = hparams.n_q;
+
+        GGML_ASSERT(ggml_get_first_tensor(ctx) != nullptr);
+
+        // Embeddings
+        // NOTE: can support more than n_q codebooks, however both small & medium models only use 4 so hardcoded
+        model.embed0_w = ggml_get_tensor(ctx, "emb.0.weight");
+        model.embed1_w = ggml_get_tensor(ctx, "emb.1.weight");
+        model.embed2_w = ggml_get_tensor(ctx, "emb.2.weight");
+        model.embed3_w = ggml_get_tensor(ctx, "emb.3.weight");
+        printf("Embedding weight shape (%d, %d)\n", model.embed0_w->ne[0], model.embed0_w->ne[1]);
+
+        // Linear Layers
+        model.linear0_w = ggml_get_tensor(ctx, "linears.0.weight");
+        model.linear1_w = ggml_get_tensor(ctx, "linears.1.weight");
+        model.linear2_w = ggml_get_tensor(ctx, "linears.2.weight");
+        model.linear3_w = ggml_get_tensor(ctx, "linears.3.weight");
+        printf("Linear weight shape (%d, %d)\n", model.linear0_w->ne[0], model.linear0_w->ne[1]);
+
+        // Normalization
+        model.out_norm_w = ggml_get_tensor(ctx, "out_norm.weight");
+        model.out_norm_b = ggml_get_tensor(ctx, "out_norm.bias");
+        printf("out_norm weight & bias shape (%d) (%d)\n", model.out_norm_w->ne[0], model.out_norm_b->ne[0]);
+
+        model.transformer = magnet_transformer();
+        auto& transformer = model.transformer;
+
+        // Reserve num_layers transformer blocks
+        transformer.transformer_blocks.resize(hparams.num_layers);
+        for (int i = 0; hparams.num_layers; i++) {
+            auto& layer = transformer.transformer_blocks[i];
+            char tmp_name[255];
+
+#define CHECK_SHAPE(tensor) \
+    GGML_ASSERT(tmp_name);  \
+    printf("%s shape: (%d, %d)\n", tmp_name, tensor->ne[0], tensor->ne[1]);
+
+            // Under the assumption that the layers are contiguous, save some time from lookup
+            snprintf(tmp_name, 255, "transformer.layers.%d.self_attn.in_proj_weight", i);
+            layer.self_attn_in_proj_w = ggml_get_tensor(ctx, tmp_name);
+            CHECK_SHAPE(layer.self_attn_in_proj_w);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.self_attn.out_proj.weight", i);
+            layer.self_attn_out_proj_w = ggml_get_next_tensor(ctx, layer.self_attn_in_proj_w);
+            CHECK_SHAPE(layer.self_attn_out_proj_w);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.linear1", i);
+            layer.linear1_w = ggml_get_next_tensor(ctx, layer.self_attn_out_proj_w);
+            CHECK_SHAPE(layer.linear1_w);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.linear2", i);
+            layer.linear2_w = ggml_get_next_tensor(ctx, layer.linear1_w);
+            CHECK_SHAPE(layer.linear2_w);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.norm1.weight", i);
+            layer.layer_norm1_w = ggml_get_next_tensor(ctx, layer.linear2_w);
+            CHECK_SHAPE(layer.layer_norm1_w);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.norm1.bias", i);
+            layer.layer_norm1_b = ggml_get_next_tensor(ctx, layer.layer_norm1_w);
+            CHECK_SHAPE(layer.layer_norm1_b);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.norm2.weight", i);
+            layer.layer_norm2_w = ggml_get_next_tensor(ctx, layer.layer_norm1_b);
+            CHECK_SHAPE(layer.layer_norm2_w);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.norm2.bias", i);
+            layer.layer_norm2_b = ggml_get_next_tensor(ctx, layer.layer_norm2_w);
+            CHECK_SHAPE(layer.layer_norm2_b);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.cross_attention.in_proj_weight", i);
+            layer.cross_attn_in_proj_w = ggml_get_next_tensor(ctx, layer.layer_norm2_b);
+            CHECK_SHAPE(layer.cross_attn_in_proj_w);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.cross_attention.out_proj.weight", i);
+            layer.cross_attn_out_proj_w = ggml_get_next_tensor(ctx, layer.cross_attn_in_proj_w);
+            CHECK_SHAPE(layer.cross_attn_out_proj_w);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.norm_cross.weight", i);
+            layer.norm_cross_w = ggml_get_next_tensor(ctx, layer.cross_attn_out_proj_w);
+            CHECK_SHAPE(layer.norm_cross_w);
+
+            snprintf(tmp_name, 255, "transformer.layers.%d.norm_cross.bias", i);
+            layer.norm_cross_b = ggml_get_next_tensor(ctx, layer.norm_cross_w);
+            CHECK_SHAPE(layer.norm_cross_b);
+        }
+    }
+
     return true;
 }
 
-int main(int argc, char** argv) {
-    printf("Hello world!\n");
-
-    magnet_context *ctx = new magnet_context();
+int main(int argc, char** argv)
+{
+    magnet_context* ctx = new magnet_context();
     ctx->model = magnet_model();
 
-    std::string file_name = "C:\\Users\\drew\\project\\magnet.cpp\\mdl\\ggml_model.bin";
+    std::string file_name = "C:\\Users\\drew\\project\\magnet.cpp\\mdl\\medium\\ggml_model.bin";
 
     load_parameters(file_name, ctx->model);
 
-    //FIXME: remove
+    // FIXME: remove
     system("pause");
 
     ggml_free(ctx->model.ctx);
