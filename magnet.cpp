@@ -1,4 +1,15 @@
-#include "ggml.h"
+#include <ggml-alloc.h>
+#include <ggml-backend.h>
+#include <ggml.h>
+
+#ifdef GGML_USE_CUBLAS
+#include <ggml-cuda.h>
+#endif
+
+#ifdef GGML_USE_METAL
+#include <ggml-metal.h>
+#endif
+
 #include <cmath>
 #include <fstream>
 #include <stdio.h>
@@ -78,6 +89,9 @@ struct magnet_model {
 
     magnet_hparams hparams;
     struct ggml_context* ctx;
+    struct ggml_tallocr* alloc;
+    ggml_backend_t backend;
+    ggml_backend_buffer_t buffer;
 };
 
 struct magnet_context {
@@ -92,23 +106,6 @@ static void ggml_log_callback_default(ggml_log_level level, const char* text, vo
     fflush(stderr);
 }
 
-// FIXME: evil hack to allocate more memory
-struct ggml_context {
-    size_t mem_size;
-    void* mem_buffer;
-    bool mem_buffer_owned;
-    bool no_alloc;
-    bool no_alloc_save; // this is used to save the no_alloc state when using scratch buffers
-
-    int n_objects;
-
-    struct ggml_object* objects_begin;
-    struct ggml_object* objects_end;
-
-    struct ggml_scratch scratch;
-    struct ggml_scratch scratch_save;
-};
-
 #define MAGNET_INFILE_MAGIC 0x46554747 // 'GGUF' LE
 #define GGUF_GET_I32(ctx, key) gguf_get_val_i32(ctx, gguf_find_key(ctx, key))
 
@@ -116,9 +113,15 @@ bool load_parameters(std::string& file_name, magnet_model& model)
 {
     // Load le model
     {
+        struct ggml_init_params params = {
+            .mem_size = 0,
+            .mem_buffer = NULL,
+        };
+        model.ctx = ggml_init(params);
+
         // Now try to init from the file
         struct gguf_init_params gguf_params {
-            .no_alloc = false,
+            .no_alloc = true,
             .ctx = &model.ctx,
         };
 
@@ -127,10 +130,6 @@ bool load_parameters(std::string& file_name, magnet_model& model)
             fprintf(stderr, "%s: Failed to load gguf file\n", __func__);
             return false;
         }
-        int n_keys = gguf_get_n_kv(gguf_ctx);
-        printf("Number of keys: %d\n", n_keys);
-        int n_tensors = gguf_get_n_tensors(gguf_ctx);
-        printf("Number of tensors: %d\n", n_tensors);
 
         model.hparams.dim = GGUF_GET_I32(gguf_ctx, "params.dim");
         model.hparams.num_heads = GGUF_GET_I32(gguf_ctx, "params.num_heads");
@@ -152,6 +151,101 @@ bool load_parameters(std::string& file_name, magnet_model& model)
         printf("kv_repeat:          %d\n", model.hparams.kv_repeat);
         printf("subcodes_context:   %d\n", model.hparams.subcodes_context);
         printf("sample_rate:        %d\n", model.hparams.sample_rate);
+
+        int n_keys = gguf_get_n_kv(gguf_ctx);
+        printf("Number of keys: %d\n", n_keys);
+        int n_tensors = gguf_get_n_tensors(gguf_ctx);
+        printf("Number of tensors: %d\n", n_tensors);
+
+        // Initialize the contexts size with tensor overhead before calculating size by tensor shape
+        size_t ctx_size = (n_tensors + 1) * ggml_tensor_overhead();
+        {
+            auto& hparams = model.hparams;
+
+            auto n_q = hparams.n_q;
+            auto input_dim = hparams.dim;
+            auto num_heads = hparams.num_heads;
+            auto num_layers = hparams.num_layers;
+            auto kv_repeat = hparams.kv_repeat;
+            auto card = hparams.card;
+            auto hidden_scale = hparams.hidden_scale;
+
+            auto embed_dim = card + 1;
+            auto dim_feedforward = hidden_scale * input_dim;
+
+            // Conditioner (HF MAGNeT checkpoints use T5)
+            // The parameters here depend on the model used
+            // In the case of magnet-small-30secs, it uses t5-base
+            // t5-base output dimension is 768- hardcoding this for now
+            // FIXME: read the conditioning parameters from the hparams file
+            auto conditioning_dim = 768;
+            // The T5 model used in this case has an nn.Linear (conditioning_dim, input_dim)
+            ctx_size += conditioning_dim * input_dim * ggml_type_size(GGML_TYPE_F16); // weight
+            ctx_size += input_dim * ggml_type_size(GGML_TYPE_F16); // bias
+
+            // Linear layers for each codebook (input_dim, card)
+            for (int i = 0; i < n_q; i++) {
+                ctx_size += input_dim * card * ggml_type_size(GGML_TYPE_F16);
+            }
+
+            // Embeddings (nn.Linear)
+            for (int i = 0; i < n_q; i++) {
+                // emb0-4 (embed_dim, input_dim)
+                ctx_size += embed_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
+            }
+
+            // out_norm (nn.LayerNorm) weight & bias = input_dim
+            ctx_size += 2 * input_dim * ggml_type_size(GGML_TYPE_F16);
+
+            // Transformer Block
+            for (int i = 0; i < num_layers; i++) {
+                // First Linear layer (1024, 4096)
+                ctx_size += input_dim * dim_feedforward * ggml_type_size(GGML_TYPE_F16);
+
+                // Second Linear Layer (4096, 1024)
+                ctx_size += dim_feedforward * input_dim * ggml_type_size(GGML_TYPE_F16);
+
+                // Normalization weight & bias (equivalent to nn.LayerNorm)
+                // norm1 (1024)
+                ctx_size += 2 * input_dim * ggml_type_size(GGML_TYPE_F16);
+                // norm2 (1024)
+                ctx_size += 2 * input_dim * ggml_type_size(GGML_TYPE_F16);
+                // norm_cross (1024)
+                ctx_size += 2 * input_dim * ggml_type_size(GGML_TYPE_F16);
+
+                // self_attn (MHA) input_proj is qkv weights
+                auto out_dim = input_dim;
+                auto num_kv = num_heads / kv_repeat;
+                auto kv_dim = (input_dim / num_heads) * num_kv;
+                out_dim += 2 * kv_dim;
+                // in_proj_weight (implemented as nn.Linear in AC) (embed_dim, out_dim)
+                ctx_size += out_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
+                // out_proj_weight (1024, 1024)
+                ctx_size += input_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
+
+                // cross_attention (MHA), follows exact same as self_attn
+                // in_proj_weight (implemented as nn.Linear in AC) (embed_dim, out_dim)
+                ctx_size += out_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
+                // out_proj_weight (1024, 1024)
+                ctx_size += input_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
+            }
+        }
+
+        // TODO: make an allocator then independently allocate each of the tensors
+        if(!model.backend) {
+            model.backend = ggml_backend_cpu_init();
+        }
+
+        auto& ctx = model.ctx;
+        ggml_set_no_alloc(ctx, true);
+        model.buffer = ggml_backend_alloc_ctx_tensors(model.ctx, model.backend);
+        ggml_get_mem_buffer(ctx);
+
+        ggml_tensor* tensor_cur = ggml_get_first_tensor(ctx);
+
+        // TODO: Based off the tensor info/offsets, manually allocate each tensor with the backend allocator
+
+        printf("Estimated size (MB): %6.2f\n", ctx_size / (1024.0 * 1024.0));
 
         gguf_free(gguf_ctx);
     }
@@ -331,7 +425,6 @@ ggml_tensor* magnet_transformer_forward(magnet_model* model, ggml_tensor* x)
     auto& ctx = model->ctx;
     // 1) Create position embeddings (MAGNeT uses sine embeddings)
     ggml_tensor* positions = ggml_arange(ctx, 0.0, tokens, 1);
-    GGML_ASSERT(false);
     // since only want one element just take the type size?
     positions = ggml_view_3d(ctx, positions, 1, -1, 1, tokens * sizeof(tokens), sizeof(tokens), 0);
     // NOTE: audiocraft adds offsets since they are streaming their transformer but idgaf atm
@@ -343,6 +436,7 @@ ggml_tensor* magnet_transformer_forward(magnet_model* model, ggml_tensor* x)
 
     for (int i = 0; i < channels; i++) {
         for (int t = 0; t < tokens; t++) {
+            // FIXME: calculate the cos/sin come back to this
             *(float*)((char*)positions->data + i * positions->nb[1] + t * positions->nb[2]) = 10.0;
         }
     }
@@ -350,10 +444,10 @@ ggml_tensor* magnet_transformer_forward(magnet_model* model, ggml_tensor* x)
     print_tensor(positions);
 
     // 2) Apply each transformer Layer
-    // auto& blocks = model->transformer.transformer_blocks;
-    // for (int i = 0; i < blocks.size(); i++) {
-    //     x = magnet_transformer_block_forward(model, &blocks[i], x);
-    // }
+    auto& blocks = model->transformer.transformer_blocks;
+    for (int i = 0; i < blocks.size(); i++) {
+        x = magnet_transformer_block_forward(model, &blocks[i], x);
+    }
 
     return x;
 }
@@ -363,32 +457,20 @@ int main(int argc, char** argv)
     magnet_context* magnet_ctx = new magnet_context();
     magnet_ctx->model = magnet_model();
 
-    size_t mem_size = 1024 * 1024 * 1024;
-    static void* buf = malloc(mem_size);
-    struct ggml_init_params params = {
-        .mem_size = mem_size,
-        .mem_buffer = buf,
-        .no_alloc = false,
-    };
-
-    magnet_ctx->model.ctx = ggml_init(params);
-    auto& ctx = magnet_ctx->model.ctx;
-    ggml_cgraph* gf = ggml_new_graph(ctx);
-    GGML_ASSERT(gf);
-
-    ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 100, 2);
-    ggml_set_param(ctx, x);
-
-    printf("%f\n", ggml_used_mem(ctx) / (1024.0 * 1024.0));
-
     std::string file_name = "C:\\Users\\drew\\project\\magnet.cpp\\mdl\\small\\ggml_model.bin";
     if (!load_parameters(file_name, magnet_ctx->model)) {
         fprintf(stderr, "%s: Failed to load model parameters\n", __func__);
         return -1;
     }
 
+    auto& ctx = magnet_ctx->model.ctx;
     GGML_ASSERT(ctx != nullptr);
-    printf("%f\n", ggml_used_mem(ctx) / (1024.0 * 1024.0));
+
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    GGML_ASSERT(gf);
+
+    ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 100, 2);
+    ggml_set_param(ctx, x);
 
     printf("starting forward\n");
     ggml_set_no_alloc(ctx, false);
