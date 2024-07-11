@@ -10,6 +10,10 @@
 #include <ggml-metal.h>
 #endif
 
+#ifdef GGML_USE_VULKAN
+#include <ggml-vulkan.h>
+#endif
+
 #include <cmath>
 #include <fstream>
 #include <stdio.h>
@@ -308,6 +312,11 @@ bool load_parameters(std::string& file_name, magnet_model& model)
             }
         }
 
+#ifdef GGML_USE_VULKAN
+        ggml_vk_instance_init()
+        model.backend = ggml_backend_vk_init(0);
+#endif
+
         if (!model.backend) {
             model.backend = ggml_backend_cpu_init();
         }
@@ -542,7 +551,7 @@ int main(int argc, char** argv)
     GGML_ASSERT(ctx != nullptr);
     auto& model = magnet_ctx->model;
 
-    magnet_ctx->galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    magnet_ctx->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     model.buffer = ggml_backend_alloc_buffer(model.backend, 1024 * 1024 * 1024); // fuck it, give it a gig!
     magnet_ctx->talloc = ggml_tallocr_new(model.buffer);
 

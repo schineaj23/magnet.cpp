@@ -13,10 +13,12 @@ parser.add_argument("--use-f16", action="store_true")
 def parse_tensors(state_dict, writer: GGUFWriter):
     tensors = state_dict["best_state"]
     for name, tensor in tensors.items():
-        print(f"Adding {name}, Shape: {tensor.shape}, Type: {tensor.dtype}")
         # type = GGMLQuantizationType.F16
         # if tensor.dtype == torch.float32:
         #     type = GGMLQuantizationType.F32
+        if not torch.cuda.is_available():
+            tensor = tensor.to(torch.float32)
+        print(f"Adding {name}, Shape: {tensor.shape}, Type: {tensor.dtype}")
         writer.add_tensor(name, tensor.numpy(), tensor.shape)
 
 def parse_hparams(state_dict, writer: GGUFWriter, use_f16: bool):
