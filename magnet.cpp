@@ -89,13 +89,15 @@ struct magnet_model {
 
     magnet_hparams hparams;
     struct ggml_context* ctx;
-    struct ggml_tallocr* alloc;
     ggml_backend_t backend;
-    ggml_backend_buffer_t buffer;
+    struct ggml_backend_buffer* buffer;
 };
 
 struct magnet_context {
     magnet_model model;
+
+    struct ggml_gallocr* galloc;
+    ggml_tallocr talloc;
 };
 
 static void ggml_log_callback_default(ggml_log_level level, const char* text, void* user_data)
@@ -109,6 +111,81 @@ static void ggml_log_callback_default(ggml_log_level level, const char* text, vo
 #define MAGNET_INFILE_MAGIC 0x46554747 // 'GGUF' LE
 #define GGUF_GET_I32(ctx, key) gguf_get_val_i32(ctx, gguf_find_key(ctx, key))
 
+// FIXME: remove this
+#define MAX_ELEMENTS_PER_DIM 6
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+static float get_value(const struct ggml_tensor* tensor, int64_t idx)
+{
+    if (tensor->type == GGML_TYPE_F32) {
+        return ((float*)tensor->data)[idx];
+    } else { // Assuming F16
+        return ggml_fp16_to_fp32(((ggml_fp16_t*)tensor->data)[idx]);
+    }
+}
+
+static void print_value(float value)
+{
+    if (std::isnan(value))
+        printf("nan");
+    else if (std::isinf(value))
+        printf("%sinf", value > 0 ? "" : "-");
+    else
+        printf("%.4f", value);
+}
+
+static void print_dim(const struct ggml_tensor* tensor, int64_t offset, int64_t stride, int64_t size, int indent)
+{
+    printf("%*s[", indent * 2, "");
+    int64_t print_count = MIN(size, MAX_ELEMENTS_PER_DIM);
+
+    for (int64_t i = 0; i < print_count; i++) {
+        if (i == MAX_ELEMENTS_PER_DIM / 2 && size > MAX_ELEMENTS_PER_DIM) {
+            printf("..., ");
+            i = size - MAX_ELEMENTS_PER_DIM / 2 - 1;
+        } else {
+            print_value(get_value(tensor, offset + i * stride));
+            if (i < print_count - 1)
+                printf(", ");
+        }
+    }
+    printf("]");
+}
+
+void print_tensor(const struct ggml_tensor* tensor)
+{
+    if (!tensor || !tensor->data) {
+        printf("Tensor or tensor data is NULL\n");
+        return;
+    }
+
+    int n_dims = ggml_n_dims(tensor);
+    printf("Tensor dimensions: ");
+    for (int i = 0; i < n_dims; i++) {
+        printf("%lld", tensor->ne[i]);
+        if (i < n_dims - 1)
+            printf(" x ");
+    }
+    printf("\nTensor type: %s\n", ggml_type_name(tensor->type));
+
+    if (tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_F32) {
+        printf("Warning: This function only prints F16 and F32 tensors correctly.\n");
+        return;
+    }
+
+    printf("tensor(");
+    int64_t offset = 0;
+    int64_t stride = 1;
+    for (int d = 0; d < n_dims; d++) {
+        print_dim(tensor, offset, stride, tensor->ne[d], n_dims - d - 1);
+        if (d < n_dims - 1) {
+            printf(",\n");
+            stride *= tensor->ne[d];
+        }
+    }
+    printf(")\n");
+}
+
 bool load_parameters(std::string& file_name, magnet_model& model)
 {
     // Load le model
@@ -121,7 +198,7 @@ bool load_parameters(std::string& file_name, magnet_model& model)
 
         // Now try to init from the file
         struct gguf_init_params gguf_params {
-            .no_alloc = true,
+            .no_alloc = false,
             .ctx = &model.ctx,
         };
 
@@ -231,19 +308,9 @@ bool load_parameters(std::string& file_name, magnet_model& model)
             }
         }
 
-        // TODO: make an allocator then independently allocate each of the tensors
-        if(!model.backend) {
+        if (!model.backend) {
             model.backend = ggml_backend_cpu_init();
         }
-
-        auto& ctx = model.ctx;
-        ggml_set_no_alloc(ctx, true);
-        model.buffer = ggml_backend_alloc_ctx_tensors(model.ctx, model.backend);
-        ggml_get_mem_buffer(ctx);
-
-        ggml_tensor* tensor_cur = ggml_get_first_tensor(ctx);
-
-        // TODO: Based off the tensor info/offsets, manually allocate each tensor with the backend allocator
 
         printf("Estimated size (MB): %6.2f\n", ctx_size / (1024.0 * 1024.0));
 
@@ -344,19 +411,25 @@ bool load_parameters(std::string& file_name, magnet_model& model)
     return true;
 }
 
+#define PRINT_SHAPE(tensor) printf("(%d, %d, %d, %d)\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+
 // 2.1) Normalize (LayerNorm https://arxiv.org/pdf/1607.06450)
-ggml_tensor* layer_norm_forward(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x)
+ggml_tensor* layer_norm_forward(ggml_context* ctx, ggml_tallocr* alloc, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x)
 {
     // layernorm = ((weight / std deviation of layer) * (input - mean)) + bias
-    ggml_tensor* mean = ggml_mean(ctx, x);
-    ggml_tensor* error = ggml_sub(ctx, x, mean);
-    ggml_tensor* variance = ggml_mean(ctx, ggml_sqr(ctx, error));
-    ggml_tensor* std_dev = ggml_sqrt(ctx, variance);
+    ggml_tensor* mean_t = ggml_mean(ctx, x);
+    GGML_ASSERT(!ggml_is_empty(mean_t));
+    GGML_ASSERT(ggml_is_scalar(mean_t));
 
-    ggml_tensor* out = ggml_add(ctx, ggml_mul_mat(ctx, ggml_div(ctx, w, std_dev), error), b);
+    // a^t - u^t
+    struct ggml_tensor* error = ggml_add1(ctx, x, ggml_neg(ctx, mean_t));
+    struct ggml_tensor* variance = ggml_mean(ctx, ggml_sqr(ctx, error));
+    struct ggml_tensor* std_dev = ggml_sqrt(ctx, variance);
+    struct ggml_tensor* out = ggml_add(ctx, ggml_mul(ctx, ggml_div(ctx, w, std_dev), error), b);
     return out;
 }
 
+#if false // FIXME: implement transformer one stage at a time. also reconsider interface
 // Multi-headed attention via the Flash Attention algorithm. https://arxiv.org/pdf/2205.14135
 ggml_tensor* multihead_attn_forward(ggml_context* ctx, ggml_tensor* k, ggml_tensor* q, ggml_tensor* v, ggml_tensor* x, int32_t num_heads, bool cross_attn)
 {
@@ -382,57 +455,24 @@ ggml_tensor* create_sin_embedding(magnet_model* model)
     return nullptr;
 }
 
-// FIXME: remove this
-void print_tensor(struct ggml_tensor* tensor)
+ggml_tensor* magnet_transformer_forward(ggml_context* ctx, ggml_tallocr* alloc, ggml_tensor* x)
 {
-    if (tensor == NULL) {
-        printf("Tensor is NULL\n");
-        return;
-    }
-
-    int64_t ne0 = tensor->ne[0];
-    int64_t ne1 = tensor->ne[1];
-    int64_t ne2 = tensor->ne[2];
-    int64_t ne3 = tensor->ne[3];
-
-    printf("Tensor dimensions: %lld x %lld x %lld x %lld\n", ne0, ne1, ne2, ne3);
-    printf("Tensor type: %d\n", tensor->type);
-
-    float* data = (float*)tensor->data;
-
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = 0; i2 < ne2; i2++) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    int64_t idx = i3 * ne2 * ne1 * ne0 + i2 * ne1 * ne0 + i1 * ne0 + i0;
-                    printf("%f ", data[idx]);
-                }
-                printf("\n");
-            }
-            printf("\n");
-        }
-        printf("\n");
-    }
-}
-
-ggml_tensor* magnet_transformer_forward(magnet_model* model, ggml_tensor* x)
-{
-    // Expected shape (B, T, C)
+    // Expected shape (B, K, S)
     auto batch_size = x->ne[0];
     auto tokens = x->ne[1];
     auto channels = x->ne[2];
 
-    auto& ctx = model->ctx;
     // 1) Create position embeddings (MAGNeT uses sine embeddings)
-    ggml_tensor* positions = ggml_arange(ctx, 0.0, tokens, 1);
+    ggml_tensor* positions = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, batch_size, tokens, channels);
+    ggml_tallocr_alloc(alloc, positions);
+
+    positions = ggml_arange(ctx, 0.0, tokens, 1);
+
     // since only want one element just take the type size?
     positions = ggml_view_3d(ctx, positions, 1, -1, 1, tokens * sizeof(tokens), sizeof(tokens), 0);
     // NOTE: audiocraft adds offsets since they are streaming their transformer but idgaf atm
     const auto MAX_PERIOD = 10000;
     auto half_dim = channels / 2;
-
-    printf("Shape (%d, %d, %d)\n", positions->ne[0], positions->ne[1], positions->ne[2]);
-    print_tensor(positions);
 
     for (int i = 0; i < channels; i++) {
         for (int t = 0; t < tokens; t++) {
@@ -441,15 +481,50 @@ ggml_tensor* magnet_transformer_forward(magnet_model* model, ggml_tensor* x)
         }
     }
 
-    print_tensor(positions);
-
     // 2) Apply each transformer Layer
-    auto& blocks = model->transformer.transformer_blocks;
-    for (int i = 0; i < blocks.size(); i++) {
-        x = magnet_transformer_block_forward(model, &blocks[i], x);
-    }
+    // auto& blocks = model->transformer.transformer_blocks;
+    // for (int i = 0; i < blocks.size(); i++) {
+    //     x = magnet_transformer_block_forward(model, &blocks[i], x);
+    // }
 
     return x;
+}
+#endif
+
+ggml_cgraph* build_graph(magnet_model& model, struct ggml_tallocr* allocr)
+{
+    static size_t buf_size = ggml_tensor_overhead() * 100000 + ggml_graph_overhead();
+    static std::vector<uint8_t> buf(buf_size);
+
+    // create dummy context
+    struct ggml_init_params params0 = {
+        .mem_size = buf_size,
+        .mem_buffer = buf.data(),
+        .no_alloc = true
+    };
+
+    // create temporary context to build the grpah
+    struct ggml_context* ctx0 = ggml_init(params0);
+
+    struct ggml_cgraph* gf = ggml_new_graph(ctx0);
+
+    struct ggml_tensor* input = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1024);
+    ggml_tallocr_alloc(allocr, input);
+
+    auto w = model.transformer.transformer_blocks[0].layer_norm1_w;
+    auto b = model.transformer.transformer_blocks[0].layer_norm1_b;
+
+    srand(time(NULL));
+    for (int i = 0; i < 1024; i++) {
+        ggml_set_f32_1d(input, i, rand());
+    }
+
+    struct ggml_tensor* result = layer_norm_forward(ctx0, allocr, w, b, input);
+
+    ggml_build_forward_expand(gf, result);
+
+    ggml_free(ctx0);
+    return gf;
 }
 
 int main(int argc, char** argv)
@@ -465,24 +540,24 @@ int main(int argc, char** argv)
 
     auto& ctx = magnet_ctx->model.ctx;
     GGML_ASSERT(ctx != nullptr);
+    auto& model = magnet_ctx->model;
 
-    ggml_cgraph* gf = ggml_new_graph(ctx);
-    GGML_ASSERT(gf);
+    magnet_ctx->galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    model.buffer = ggml_backend_alloc_buffer(model.backend, 1024 * 1024 * 1024); // fuck it, give it a gig!
+    magnet_ctx->talloc = ggml_tallocr_new(model.buffer);
 
-    ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 100, 2);
-    ggml_set_param(ctx, x);
+    ggml_cgraph* graph = build_graph(model, &magnet_ctx->talloc);
+    ggml_gallocr_alloc_graph(magnet_ctx->galloc, graph);
+    ggml_graph_print(graph);
 
-    printf("starting forward\n");
-    ggml_set_no_alloc(ctx, false);
-    magnet_transformer_forward(&magnet_ctx->model, x);
-
-    ggml_build_forward_expand(gf, x);
-    ggml_graph_compute_with_ctx(ctx, gf, 8);
+    ggml_backend_graph_compute(model.backend, graph);
+    auto out = graph->nodes[graph->n_nodes - 1];
+    print_tensor(out);
 
     // FIXME: remove
-    system("pause");
     ggml_free(magnet_ctx->model.ctx);
+    ggml_backend_free(model.backend);
+    ggml_gallocr_free(magnet_ctx->galloc);
     delete magnet_ctx;
-
     return 0;
 }
