@@ -238,90 +238,15 @@ bool load_parameters(std::string& file_name, magnet_model& model)
         int n_tensors = gguf_get_n_tensors(gguf_ctx);
         printf("Number of tensors: %d\n", n_tensors);
 
-        // Initialize the contexts size with tensor overhead before calculating size by tensor shape
-        size_t ctx_size = (n_tensors + 1) * ggml_tensor_overhead();
-        {
-            auto& hparams = model.hparams;
-
-            auto n_q = hparams.n_q;
-            auto input_dim = hparams.dim;
-            auto num_heads = hparams.num_heads;
-            auto num_layers = hparams.num_layers;
-            auto kv_repeat = hparams.kv_repeat;
-            auto card = hparams.card;
-            auto hidden_scale = hparams.hidden_scale;
-
-            auto embed_dim = card + 1;
-            auto dim_feedforward = hidden_scale * input_dim;
-
-            // Conditioner (HF MAGNeT checkpoints use T5)
-            // The parameters here depend on the model used
-            // In the case of magnet-small-30secs, it uses t5-base
-            // t5-base output dimension is 768- hardcoding this for now
-            // FIXME: read the conditioning parameters from the hparams file
-            auto conditioning_dim = 768;
-            // The T5 model used in this case has an nn.Linear (conditioning_dim, input_dim)
-            ctx_size += conditioning_dim * input_dim * ggml_type_size(GGML_TYPE_F16); // weight
-            ctx_size += input_dim * ggml_type_size(GGML_TYPE_F16); // bias
-
-            // Linear layers for each codebook (input_dim, card)
-            for (int i = 0; i < n_q; i++) {
-                ctx_size += input_dim * card * ggml_type_size(GGML_TYPE_F16);
-            }
-
-            // Embeddings (nn.Linear)
-            for (int i = 0; i < n_q; i++) {
-                // emb0-4 (embed_dim, input_dim)
-                ctx_size += embed_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
-            }
-
-            // out_norm (nn.LayerNorm) weight & bias = input_dim
-            ctx_size += 2 * input_dim * ggml_type_size(GGML_TYPE_F16);
-
-            // Transformer Block
-            for (int i = 0; i < num_layers; i++) {
-                // First Linear layer (1024, 4096)
-                ctx_size += input_dim * dim_feedforward * ggml_type_size(GGML_TYPE_F16);
-
-                // Second Linear Layer (4096, 1024)
-                ctx_size += dim_feedforward * input_dim * ggml_type_size(GGML_TYPE_F16);
-
-                // Normalization weight & bias (equivalent to nn.LayerNorm)
-                // norm1 (1024)
-                ctx_size += 2 * input_dim * ggml_type_size(GGML_TYPE_F16);
-                // norm2 (1024)
-                ctx_size += 2 * input_dim * ggml_type_size(GGML_TYPE_F16);
-                // norm_cross (1024)
-                ctx_size += 2 * input_dim * ggml_type_size(GGML_TYPE_F16);
-
-                // self_attn (MHA) input_proj is qkv weights
-                auto out_dim = input_dim;
-                auto num_kv = num_heads / kv_repeat;
-                auto kv_dim = (input_dim / num_heads) * num_kv;
-                out_dim += 2 * kv_dim;
-                // in_proj_weight (implemented as nn.Linear in AC) (embed_dim, out_dim)
-                ctx_size += out_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
-                // out_proj_weight (1024, 1024)
-                ctx_size += input_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
-
-                // cross_attention (MHA), follows exact same as self_attn
-                // in_proj_weight (implemented as nn.Linear in AC) (embed_dim, out_dim)
-                ctx_size += out_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
-                // out_proj_weight (1024, 1024)
-                ctx_size += input_dim * input_dim * ggml_type_size(GGML_TYPE_F16);
-            }
-        }
-
 #ifdef GGML_USE_VULKAN
         ggml_vk_instance_init()
-        model.backend = ggml_backend_vk_init(0);
+            model.backend
+            = ggml_backend_vk_init(0);
 #endif
 
         if (!model.backend) {
             model.backend = ggml_backend_cpu_init();
         }
-
-        printf("Estimated size (MB): %6.2f\n", ctx_size / (1024.0 * 1024.0));
 
         gguf_free(gguf_ctx);
     }
