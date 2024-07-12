@@ -116,7 +116,7 @@ static void ggml_log_callback_default(ggml_log_level level, const char* text, vo
 #define GGUF_GET_I32(ctx, key) gguf_get_val_i32(ctx, gguf_find_key(ctx, key))
 
 // FIXME: remove this
-#define MAX_ELEMENTS_PER_DIM 6
+#define MAX_ELEMENTS_PER_DIM 100
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 static float get_value(const struct ggml_tensor* tensor, int64_t idx)
@@ -348,48 +348,93 @@ bool load_parameters(std::string& file_name, magnet_model& model)
 #define PRINT_SHAPE(tensor) printf("(%d, %d, %d, %d)\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
 
 // 2.1) Normalize (LayerNorm https://arxiv.org/pdf/1607.06450)
-ggml_tensor* layer_norm_forward(ggml_context* ctx, ggml_tallocr* alloc, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x)
+ggml_tensor* layer_norm_forward(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x)
 {
-    // layernorm = ((weight / std deviation of layer) * (input - mean)) + bias
-    ggml_tensor* mean_t = ggml_mean(ctx, x);
-    GGML_ASSERT(!ggml_is_empty(mean_t));
-    GGML_ASSERT(ggml_is_scalar(mean_t));
-
-    // a^t - u^t
-    struct ggml_tensor* error = ggml_add1(ctx, x, ggml_neg(ctx, mean_t));
-    struct ggml_tensor* variance = ggml_mean(ctx, ggml_sqr(ctx, error));
-    struct ggml_tensor* std_dev = ggml_sqrt(ctx, variance);
-    struct ggml_tensor* out = ggml_add(ctx, ggml_mul(ctx, ggml_div(ctx, w, std_dev), error), b);
-    return out;
+    // layer_norm = ((x - mean) / sqrt(variance(x))) * weight + bias
+    // Saw from codebase that ggml_norm does the variance & mean calculations already!!
+    return ggml_add_inplace(ctx, ggml_mul_inplace(ctx, ggml_norm(ctx, x, 1e-5f), w), b);
 }
 
-#if false // FIXME: implement transformer one stage at a time. also reconsider interface
-// Multi-headed attention via the Flash Attention algorithm. https://arxiv.org/pdf/2205.14135
+// Multi-headed attention (standard)
+// In the future, use Flash Attention algorithm. https://arxiv.org/pdf/2205.14135
 ggml_tensor* multihead_attn_forward(ggml_context* ctx, ggml_tensor* k, ggml_tensor* q, ggml_tensor* v, ggml_tensor* x, int32_t num_heads, bool cross_attn)
 {
     return nullptr;
 }
 
-ggml_tensor* magnet_transformer_block_forward(magnet_model* model, magnet_transformer_block* block, ggml_tensor* x)
+// Linear transformation layer
+ggml_tensor* magnet_linear_forward(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b = nullptr)
 {
-    auto& ctx = model->ctx;
+    ggml_tensor* out = ggml_mul_mat(ctx, x, w);
+    if (b != nullptr) {
+        out = ggml_add(ctx, out, b);
+    }
+    return out;
+}
+
+ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context* ctx, magnet_transformer_block* block, ggml_tensor* x)
+{
+    const auto& hparams = model->hparams;
+    PRINT_SHAPE(block->layer_norm1_w);
     // 2.1) Normalize (LayerNorm https://arxiv.org/pdf/1607.06450)
-    x = layer_norm_forward(ctx, block->layer_norm1_w, block->layer_norm1_b, x);
+    x = layer_norm_forward(ctx, ggml_repeat(ctx, block->layer_norm1_w, x), ggml_repeat(ctx, block->layer_norm1_b, x), x);
+    printf("After first layernorm: ");
+    PRINT_SHAPE(x);
+
     // 2.2) Self attention (use Flash Attention, see paper https://arxiv.org/abs/2205.14135)
-    // 2.3) Cross attn normalization (LayerNorm)
+
+    // Forward Linear of projected weights teehee
+    struct ggml_tensor* projected = magnet_linear_forward(ctx, x, block->self_attn_in_proj_w);
+    printf("After forward pass: ");
+    PRINT_SHAPE(projected);
+
+    auto dim = hparams.dim;
+    auto card = hparams.card;
+    auto hidden_scale = hparams.hidden_scale;
+    auto embed_dim = card + 1;
+    auto start = embed_dim;
+    auto per_head_dim = dim / hparams.num_heads;
+    auto kv_heads = hparams.num_heads / hparams.kv_repeat;
+    auto end = (start + per_head_dim * kv_heads) - 1;
+
+    printf("per_head_dim: %d, kv_heads: %d, kv_repeat: %d, embed_dim: %d, start: %d, end: %d\n", per_head_dim, kv_heads, hparams.kv_repeat, embed_dim, start, end);
+    // EXPECTING THE LAYOUT (b, t, h, d)
+
+    struct ggml_tensor* k = ggml_view_3d(ctx, projected, projected->ne[0], projected->ne[1], embed_dim, projected->nb[1], projected->nb[2], 0);
+    printf("k :");
+    PRINT_SHAPE(k);
+    struct ggml_tensor* q = ggml_view_3d(ctx, projected, projected->ne[0], projected->ne[1], start - end, projected->nb[1], start * ggml_type_size(projected->type), 0);
+    struct ggml_tensor* v = ggml_view_3d(ctx, projected, projected->ne[0], projected->ne[1], projected->ne[2] - end, projected->nb[1], end * ggml_type_size(projected->type), 0);
+
+    printf("q :");
+    PRINT_SHAPE(q);
+    printf("v :");
+    PRINT_SHAPE(v);
+
+    // 2.3) Cross attn normalization (LayerNorm). This is done with the provided conditions
     // 2.4) Cross attention
     // 2.5) Feedforward block (linears)
     // 2.6) Normalize (LayerNorm)
 
-    return x;
+    return projected;
 }
 
-ggml_tensor* create_sin_embedding(magnet_model* model)
+// Positional encoding must be a custom operation
+void magnet_positional_encoding(struct ggml_tensor* dst, const struct ggml_tensor* src, int ith, int nth, void* userdata)
 {
-    return nullptr;
+    GGML_ASSERT(ggml_are_same_shape(dst, src));
+    // at the moment only have 2 dimensions so don't care about other channels!
+    const auto MAX_PERIOD = 10000;
+    for (int i = 0; i < src->ne[0]; i++) {
+        for (int pos = 0; pos < src->ne[i]; pos++) {
+            float inner = pos / pow(MAX_PERIOD, (2.0 * i) / 1024.0);
+            float val = (i % 2 == 0) ? cos(inner) : sin(inner);
+            ggml_set_f32_nd(dst, i, pos, 0, 0, val);
+        }
+    }
 }
 
-ggml_tensor* magnet_transformer_forward(ggml_context* ctx, ggml_tallocr* alloc, ggml_tensor* x)
+ggml_tensor* magnet_transformer_forward(magnet_model* model, ggml_context* ctx, ggml_tallocr* alloc, ggml_tensor* x)
 {
     // Expected shape (B, K, S)
     auto batch_size = x->ne[0];
@@ -400,34 +445,22 @@ ggml_tensor* magnet_transformer_forward(ggml_context* ctx, ggml_tallocr* alloc, 
     ggml_tensor* positions = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, batch_size, tokens, channels);
     ggml_tallocr_alloc(alloc, positions);
 
-    positions = ggml_arange(ctx, 0.0, tokens, 1);
-
-    // since only want one element just take the type size?
-    positions = ggml_view_3d(ctx, positions, 1, -1, 1, tokens * sizeof(tokens), sizeof(tokens), 0);
-    // NOTE: audiocraft adds offsets since they are streaming their transformer but idgaf atm
-    const auto MAX_PERIOD = 10000;
-    auto half_dim = channels / 2;
-
-    for (int i = 0; i < channels; i++) {
-        for (int t = 0; t < tokens; t++) {
-            // FIXME: calculate the cos/sin come back to this
-            *(float*)((char*)positions->data + i * positions->nb[1] + t * positions->nb[2]) = 10.0;
-        }
-    }
+    // Positional encoding!!!! :D
+    positions = ggml_map_custom1(ctx, positions, magnet_positional_encoding, GGML_N_TASKS_MAX, NULL);
+    x = ggml_add(ctx, positions, x);
 
     // 2) Apply each transformer Layer
-    // auto& blocks = model->transformer.transformer_blocks;
-    // for (int i = 0; i < blocks.size(); i++) {
-    //     x = magnet_transformer_block_forward(model, &blocks[i], x);
-    // }
+    auto& blocks = model->transformer.transformer_blocks;
+    for (int i = 0; i < blocks.size(); i++) {
+        x = magnet_transformer_block_forward(model, ctx, &blocks[i], x);
+    }
 
     return x;
 }
-#endif
 
 ggml_cgraph* build_graph(magnet_model& model, struct ggml_tallocr* allocr)
 {
-    static size_t buf_size = ggml_tensor_overhead() * 100000 + ggml_graph_overhead();
+    static size_t buf_size = ggml_tensor_overhead() * 100000 + ggml_graph_overhead() + (1024 * 1024 * 1024);
     static std::vector<uint8_t> buf(buf_size);
 
     // create dummy context
@@ -442,18 +475,22 @@ ggml_cgraph* build_graph(magnet_model& model, struct ggml_tallocr* allocr)
 
     struct ggml_cgraph* gf = ggml_new_graph(ctx0);
 
-    struct ggml_tensor* input = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1024);
+    struct ggml_tensor* input = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1024, 2);
     ggml_tallocr_alloc(allocr, input);
 
-    auto w = model.transformer.transformer_blocks[0].layer_norm1_w;
-    auto b = model.transformer.transformer_blocks[0].layer_norm1_b;
+    // apply the embeddings before passing it to the transformer
 
     srand(time(NULL));
-    for (int i = 0; i < 1024; i++) {
-        ggml_set_f32_1d(input, i, rand());
+    for (int c = 0; c < input->ne[2]; c++) {
+        for (int i = 0; i < input->ne[1]; i++) {
+            ggml_set_f32_nd(input, 1, i, c, 1, rand());
+        }
     }
+    PRINT_SHAPE(input);
 
-    struct ggml_tensor* result = layer_norm_forward(ctx0, allocr, w, b, input);
+    // FIXME: implement other modules, starting with layernorm to make sure stuff works
+    // struct ggml_tensor* result = layer_norm_forward(ctx0, w, b, input);
+    struct ggml_tensor* result = magnet_transformer_forward(&model, ctx0, allocr, input);
 
     ggml_build_forward_expand(gf, result);
 
@@ -488,7 +525,6 @@ int main(int argc, char** argv)
     auto out = graph->nodes[graph->n_nodes - 1];
     print_tensor(out);
 
-    // FIXME: remove
     ggml_free(magnet_ctx->model.ctx);
     ggml_backend_free(model.backend);
     ggml_gallocr_free(magnet_ctx->galloc);
