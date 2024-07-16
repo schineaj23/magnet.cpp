@@ -289,7 +289,7 @@ bool load_parameters(std::string& file_name, magnet_model& model)
 
 #define CHECK_SHAPE(tensor) \
     GGML_ASSERT(tmp_name);  \
-    // printf("%s shape: (%d, %d)\n", tmp_name, tensor->ne[0], tensor->ne[1]);
+    printf("%s shape: (%d, %d, %d, %d)\n", tmp_name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
 
             // Under the assumption that the layers are contiguous, save some time from lookup
             snprintf(tmp_name, 255, "transformer.layers.%d.self_attn.in_proj_weight", i);
@@ -351,8 +351,8 @@ bool load_parameters(std::string& file_name, magnet_model& model)
 ggml_tensor* layer_norm_forward(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x)
 {
     // layer_norm = ((x - mean) / sqrt(variance(x))) * weight + bias
-    // Saw from codebase that ggml_norm does the variance & mean calculations already!!
-    return ggml_add_inplace(ctx, ggml_mul_inplace(ctx, ggml_norm(ctx, x, 1e-5f), w), b);
+    // use oneliner instead
+    return ggml_add_inplace(ctx, ggml_mul_inplace(ctx, ggml_norm_inplace(ctx, x, 1e-5), w), b);
 }
 
 // Multi-headed attention (standard)
@@ -375,48 +375,76 @@ ggml_tensor* magnet_linear_forward(ggml_context* ctx, ggml_tensor* x, ggml_tenso
 ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context* ctx, magnet_transformer_block* block, ggml_tensor* x)
 {
     const auto& hparams = model->hparams;
-    PRINT_SHAPE(block->layer_norm1_w);
+
     // 2.1) Normalize (LayerNorm https://arxiv.org/pdf/1607.06450)
-    x = layer_norm_forward(ctx, ggml_repeat(ctx, block->layer_norm1_w, x), ggml_repeat(ctx, block->layer_norm1_b, x), x);
+    // can cheat and just use the last dim
+    // shape is B, T, C. normalize along dimension 1 (T)
+
+    // Make the correct shape for the layer norm (only care about normalizing the T layers)
+    x = ggml_cont(ctx, ggml_transpose(ctx, x));
+
+    struct ggml_tensor* norm_out = layer_norm_forward(ctx, block->layer_norm1_w, block->layer_norm1_b, x);
     printf("After first layernorm: ");
     PRINT_SHAPE(x);
 
     // 2.2) Self attention (use Flash Attention, see paper https://arxiv.org/abs/2205.14135)
+    {
+        // Forward Linear of projected weights
+        struct ggml_tensor* projected = magnet_linear_forward(ctx, x, block->self_attn_in_proj_w);
+        x = ggml_cont(ctx, ggml_transpose(ctx, x));
+        printf("After forward pass: ");
+        PRINT_SHAPE(projected);
 
-    // Forward Linear of projected weights teehee
-    struct ggml_tensor* projected = magnet_linear_forward(ctx, x, block->self_attn_in_proj_w);
-    printf("After forward pass: ");
-    PRINT_SHAPE(projected);
+        auto embed_dim = hparams.dim;
+        auto n_heads = hparams.num_heads;
+        auto head_dim = embed_dim / n_heads;
+        auto n_kv = hparams.kv_repeat;
+        auto n_head_kv = n_heads / n_kv;
+        auto n_batch = 1;
 
-    auto dim = hparams.dim;
-    auto card = hparams.card;
-    auto hidden_scale = hparams.hidden_scale;
-    auto embed_dim = card + 1;
-    auto start = embed_dim;
-    auto per_head_dim = dim / hparams.num_heads;
-    auto kv_heads = hparams.num_heads / hparams.kv_repeat;
-    auto end = (start + per_head_dim * kv_heads) - 1;
+        printf("embed_dim: %d, n_heads: %d, head_dim: %d, n_kv: %d, n_head_kv: %d, n_batch: %d\n", embed_dim, n_heads, head_dim, n_kv, n_head_kv, n_batch);
+        printf("nelements(projected): %d, expected nelements(q): %d\n", ggml_nelements(projected), head_dim * n_batch * n_heads);
+        // k, q, v are all packed into the output here. k offset = 0, q = embed_dim (1024)
 
-    printf("per_head_dim: %d, kv_heads: %d, kv_repeat: %d, embed_dim: %d, start: %d, end: %d\n", per_head_dim, kv_heads, hparams.kv_repeat, embed_dim, start, end);
-    // EXPECTING THE LAYOUT (b, t, h, d)
+        struct ggml_tensor* q = ggml_view_1d(ctx, projected, head_dim * n_batch * n_heads, 0);
+        q = ggml_reshape_3d(ctx, q, head_dim, n_batch, n_heads);
+        printf("q: ");
+        PRINT_SHAPE(q);
 
-    struct ggml_tensor* k = ggml_view_3d(ctx, projected, projected->ne[0], projected->ne[1], embed_dim, projected->nb[1], projected->nb[2], 0);
-    printf("k :");
-    PRINT_SHAPE(k);
-    struct ggml_tensor* q = ggml_view_3d(ctx, projected, projected->ne[0], projected->ne[1], start - end, projected->nb[1], start * ggml_type_size(projected->type), 0);
-    struct ggml_tensor* v = ggml_view_3d(ctx, projected, projected->ne[0], projected->ne[1], projected->ne[2] - end, projected->nb[1], end * ggml_type_size(projected->type), 0);
+        struct ggml_tensor* k = ggml_view_1d(ctx, projected, head_dim * n_kv * n_head_kv, embed_dim * ggml_type_size(projected->type));
+        k = ggml_reshape_3d(ctx, k, head_dim, n_kv, n_head_kv);
+        printf("k: ");
+        PRINT_SHAPE(k);
 
-    printf("q :");
-    PRINT_SHAPE(q);
-    printf("v :");
-    PRINT_SHAPE(v);
+        struct ggml_tensor* v = ggml_view_1d(ctx, projected, head_dim * n_kv * n_head_kv, 2 * embed_dim * ggml_type_size(projected->type));
+        v = ggml_reshape_3d(ctx, v, head_dim, n_kv, n_head_kv);
+        printf("v: ");
+        PRINT_SHAPE(v);
+
+        // use flash attention op :D
+        // FIXME: use mask provided by model input (get this from a magnet_context?)
+        struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, projected->type, n_kv, GGML_PAD(1, GGML_KQ_MASK_PAD));
+        GGML_ASSERT(mask);
+
+        struct ggml_tensor* self_attn = ggml_flash_attn_ext(ctx, q, k, v, mask, 1, 1); // small: [64, 16, 1, 1]
+        printf("self_attn output: ");
+        PRINT_SHAPE(self_attn);
+
+        // then apply the out_proj
+        self_attn = ggml_reshape_1d(ctx, self_attn, embed_dim);
+        self_attn = magnet_linear_forward(ctx, self_attn, block->self_attn_out_proj_w);
+        printf("self_attn after out_proj linear: ");
+        PRINT_SHAPE(self_attn);
+
+        x = ggml_add(ctx, x, self_attn);
+    }
 
     // 2.3) Cross attn normalization (LayerNorm). This is done with the provided conditions
     // 2.4) Cross attention
     // 2.5) Feedforward block (linears)
     // 2.6) Normalize (LayerNorm)
 
-    return projected;
+    return x;
 }
 
 // Positional encoding must be a custom operation
@@ -447,11 +475,15 @@ ggml_tensor* magnet_transformer_forward(magnet_model* model, ggml_context* ctx, 
 
     // Positional encoding!!!! :D
     positions = ggml_map_custom1(ctx, positions, magnet_positional_encoding, GGML_N_TASKS_MAX, NULL);
+    printf("positions shape: ");
+    PRINT_SHAPE(positions);
     x = ggml_add(ctx, positions, x);
+    printf("x shape before blocks: ");
+    PRINT_SHAPE(x);
 
     // 2) Apply each transformer Layer
     auto& blocks = model->transformer.transformer_blocks;
-    for (int i = 0; i < blocks.size(); i++) {
+    for (int i = 0; i < 1; i++) {
         x = magnet_transformer_block_forward(model, ctx, &blocks[i], x);
     }
 
@@ -475,18 +507,16 @@ ggml_cgraph* build_graph(magnet_model& model, struct ggml_tallocr* allocr)
 
     struct ggml_cgraph* gf = ggml_new_graph(ctx0);
 
-    struct ggml_tensor* input = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1024, 2);
+    // The transformer expects B, T, C
+    struct ggml_tensor* input = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, model.hparams.dim, 1);
     ggml_tallocr_alloc(allocr, input);
 
-    // apply the embeddings before passing it to the transformer
-
-    srand(time(NULL));
+    srand(0);
     for (int c = 0; c < input->ne[2]; c++) {
         for (int i = 0; i < input->ne[1]; i++) {
             ggml_set_f32_nd(input, 1, i, c, 1, rand());
         }
     }
-    PRINT_SHAPE(input);
 
     // FIXME: implement other modules, starting with layernorm to make sure stuff works
     // struct ggml_tensor* result = layer_norm_forward(ctx0, w, b, input);
