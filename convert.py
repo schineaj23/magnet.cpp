@@ -15,8 +15,8 @@ def parse_tensors(state_dict, writer: GGUFWriter):
         # type = GGMLQuantizationType.F16
         # if tensor.dtype == torch.float32:
         #     type = GGMLQuantizationType.F32
-        if not torch.cuda.is_available():
-            tensor = tensor.to(torch.float32)
+        #if not torch.cuda.is_available():
+        #    tensor = tensor.to(torch.float32)
         print(f"Adding {name}, Shape: {tensor.shape}, Type: {tensor.dtype}")
         writer.add_tensor(name, tensor.numpy(), tensor.shape)
 
