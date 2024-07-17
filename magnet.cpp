@@ -368,7 +368,12 @@ ggml_tensor* magnet_linear_forward(ggml_context* ctx, ggml_tensor* x, ggml_tenso
 ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context* ctx, magnet_transformer_block* block, ggml_tensor* x)
 {
     const auto& hparams = model->hparams;
-
+    auto embed_dim = hparams.dim;
+    auto n_heads = hparams.num_heads;
+    auto head_dim = embed_dim / n_heads;
+    auto n_kv = hparams.kv_repeat;
+    auto n_head_kv = n_heads / n_kv;
+    auto n_batch = 1;
     // 2.1) Normalize (LayerNorm https://arxiv.org/pdf/1607.06450)
     // can cheat and just use the last dim
     // shape is B, T, C. normalize along dimension 1 (T)
@@ -377,6 +382,11 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
     {
         x = ggml_cont(ctx, ggml_transpose(ctx, x));
 
+        if (ggml_backend_is_cpu(model->backend)) {
+            block->layer_norm1_w = ggml_cast(ctx, block->layer_norm1_w, GGML_TYPE_F32);
+            block->layer_norm1_b = ggml_cast(ctx, block->layer_norm1_b, GGML_TYPE_F32);
+        }
+
         x = magnet_layer_norm_forward(ctx, block->layer_norm1_w, block->layer_norm1_b, x);
         printf("After first layernorm: ");
         PRINT_SHAPE(x);
@@ -384,18 +394,16 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
 
     // 2.2) Self attention (use Flash Attention, see paper https://arxiv.org/abs/2205.14135)
     {
+        if (ggml_backend_is_cpu(model->backend)) {
+            block->self_attn_in_proj_w = ggml_cast(ctx, block->self_attn_in_proj_w, GGML_TYPE_F32);
+            block->self_attn_out_proj_w = ggml_cast(ctx, block->self_attn_out_proj_w, GGML_TYPE_F32);
+        }
+
         // Forward Linear of projected weights
         struct ggml_tensor* projected = magnet_linear_forward(ctx, x, block->self_attn_in_proj_w);
         projected = ggml_cont(ctx, ggml_transpose(ctx, projected));
         printf("After forward pass: ");
         PRINT_SHAPE(projected);
-
-        auto embed_dim = hparams.dim;
-        auto n_heads = hparams.num_heads;
-        auto head_dim = embed_dim / n_heads;
-        auto n_kv = hparams.kv_repeat;
-        auto n_head_kv = n_heads / n_kv;
-        auto n_batch = 1;
 
         printf("embed_dim: %d, n_heads: %d, head_dim: %d, n_kv: %d, n_head_kv: %d, n_batch: %d\n", embed_dim, n_heads, head_dim, n_kv, n_head_kv, n_batch);
         printf("nelements(projected): %d, expected nelements(q): %d\n", ggml_nelements(projected), head_dim * n_batch * n_heads);
@@ -439,9 +447,68 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
 
     // 2.3) Cross attn normalization (LayerNorm). This is done with the provided conditions
     {
+        if (ggml_backend_is_cpu(model->backend)) {
+            block->norm_cross_w = ggml_cast(ctx, block->norm_cross_w, GGML_TYPE_F32);
+            block->norm_cross_b = ggml_cast(ctx, block->norm_cross_b, GGML_TYPE_F32);
+        }
         x = magnet_layer_norm_forward(ctx, block->norm_cross_w, block->norm_cross_b, x);
     }
     // 2.4) Cross attention
+    {
+        if (ggml_backend_is_cpu(model->backend)) {
+            block->cross_attn_in_proj_w = ggml_cast(ctx, block->cross_attn_in_proj_w, GGML_TYPE_F32);
+            block->cross_attn_out_proj_w = ggml_cast(ctx, block->cross_attn_out_proj_w, GGML_TYPE_F32);
+        }
+        // FIXME: Implement cross attention (fuser) (MAGNeT can take conditions, this is done on the transformer level, use same conditions for each block)
+        // This tensor should be a field of the magnet_transformer or magnet_t
+        // For now, use dummy tensor for the cross attention source and derive qkv from there
+        struct ggml_tensor* cross_attn_src = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, embed_dim);
+
+        // Audiocraft (reference MAGNeT implementation) has the query from input (x), keys & values from the conditioning tensor (cross_attn_src)
+        // The weight tensor is stacked vectors, creating the shape [3 * embed_dim, embed_dim], slice to get weights for qkv (calc independently)
+        // The shape of q, k, v into the flash_attn_ext op remains the same
+        struct ggml_tensor* q_slice = ggml_view_2d(ctx, block->cross_attn_in_proj_w, embed_dim, embed_dim, block->cross_attn_in_proj_w->nb[1], 0);
+        struct ggml_tensor* q = magnet_linear_forward(ctx, x, q_slice);
+        q = ggml_reshape_3d(ctx, q, head_dim, n_batch, n_heads);
+
+        struct ggml_tensor* k_slice = ggml_view_2d(ctx, block->cross_attn_in_proj_w, embed_dim, embed_dim, block->cross_attn_in_proj_w->nb[1], embed_dim);
+        struct ggml_tensor* k = magnet_linear_forward(ctx, cross_attn_src, k_slice);
+        k = ggml_reshape_3d(ctx, k, head_dim, n_kv, n_head_kv);
+
+        struct ggml_tensor* v_slice = ggml_view_2d(ctx, block->cross_attn_in_proj_w, embed_dim, embed_dim, block->cross_attn_in_proj_w->nb[1], 2 * embed_dim);
+        struct ggml_tensor* v = magnet_linear_forward(ctx, cross_attn_src, v_slice);
+        v = ggml_reshape_3d(ctx, v, head_dim, n_kv, n_head_kv);
+
+        printf("cross_attn q: ");
+        PRINT_SHAPE(q);
+        printf("cross_attn k: ");
+        PRINT_SHAPE(k);
+        printf("cross_attn v: ");
+        PRINT_SHAPE(v);
+
+        // Hack to prevent segfaulting on CPU backend
+        if (ggml_backend_is_cpu(model->backend)) {
+            q = ggml_cast(ctx, q, GGML_TYPE_F16);
+            k = ggml_cast(ctx, k, GGML_TYPE_F16);
+            v = ggml_cast(ctx, v, GGML_TYPE_F16);
+        }
+
+        // Apply the mask and attention op in the same manner
+        // FIXME: use mask provided by model input (get this from a magnet_context?)
+        struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, block->cross_attn_in_proj_w->type, n_kv, 64);
+
+        struct ggml_tensor* cross_attn = ggml_flash_attn_ext(ctx, q, k, v, mask, 1, 0); // small: [64, 16, 1, 1]
+        printf("cross_attn output: ");
+
+        // then apply the out_proj
+        cross_attn = ggml_reshape_1d(ctx, cross_attn, embed_dim);
+        cross_attn = magnet_linear_forward(ctx, cross_attn, block->cross_attn_out_proj_w);
+        cross_attn = ggml_transpose(ctx, cross_attn);
+        printf("cross_attn after out_proj linear: ");
+        PRINT_SHAPE(cross_attn);
+
+        x = ggml_add(ctx, x, cross_attn);
+    }
     // 2.5) Feedforward block (linears)
     // 2.6) Normalize (LayerNorm)
 
