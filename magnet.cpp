@@ -453,6 +453,7 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
         }
         x = magnet_layer_norm_forward(ctx, block->norm_cross_w, block->norm_cross_b, x);
     }
+
     // 2.4) Cross attention
     {
         if (ggml_backend_is_cpu(model->backend)) {
@@ -498,7 +499,6 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
         struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, block->cross_attn_in_proj_w->type, n_kv, 64);
 
         struct ggml_tensor* cross_attn = ggml_flash_attn_ext(ctx, q, k, v, mask, 1, 0); // small: [64, 16, 1, 1]
-        printf("cross_attn output: ");
 
         // then apply the out_proj
         cross_attn = ggml_reshape_1d(ctx, cross_attn, embed_dim);
@@ -509,8 +509,39 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
 
         x = ggml_add(ctx, x, cross_attn);
     }
-    // 2.5) Feedforward block (linears)
-    // 2.6) Normalize (LayerNorm)
+
+    // 2.5) Normalize (LayerNorm)
+    {
+        if (ggml_backend_is_cpu(model->backend)) {
+            block->layer_norm2_w = ggml_cast(ctx, block->layer_norm2_w, GGML_TYPE_F32);
+            block->layer_norm2_b = ggml_cast(ctx, block->layer_norm2_b, GGML_TYPE_F32);
+        }
+
+        x = magnet_layer_norm_forward(ctx, block->layer_norm2_w, block->layer_norm2_b, x);
+        printf("shape after norm 2: ");
+        PRINT_SHAPE(x);
+    }
+
+    // 2.6) Feedforward block (linears)
+    {
+        if (ggml_backend_is_cpu(model->backend)) {
+            block->linear1_w = ggml_cast(ctx, block->linear1_w, GGML_TYPE_F32);
+            block->linear2_w = ggml_cast(ctx, block->linear2_w, GGML_TYPE_F32);
+        }
+
+        printf("shape before ff block: ");
+        PRINT_SHAPE(x);
+
+        struct ggml_tensor* x_p = magnet_linear_forward(ctx, x, block->linear1_w);
+        x_p = ggml_gelu(ctx, x_p);
+        x_p = ggml_cont(ctx, ggml_transpose(ctx, x_p));
+        x_p = magnet_linear_forward(ctx, x_p, block->linear2_w);
+        printf("x_p: ");
+        PRINT_SHAPE(x_p);
+
+        x_p = ggml_cont(ctx, ggml_transpose(ctx, x_p));
+        x = ggml_add(ctx, x, x_p);
+    }
 
     return x;
 }
