@@ -383,7 +383,7 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
     // Make the correct shape for the layer norm (only care about normalizing the T layers)
     x = ggml_cont(ctx, ggml_transpose(ctx, x));
 
-    struct ggml_tensor* norm_out = layer_norm_forward(ctx, block->layer_norm1_w, block->layer_norm1_b, x);
+    x = layer_norm_forward(ctx, block->layer_norm1_w, block->layer_norm1_b, x);
     printf("After first layernorm: ");
     PRINT_SHAPE(x);
 
@@ -437,7 +437,6 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
         self_attn = ggml_transpose(ctx, self_attn);
         printf("self_attn after out_proj linear: ");
         PRINT_SHAPE(self_attn);
-        
 
         x = ggml_add(ctx, x, self_attn);
     }
