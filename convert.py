@@ -1,8 +1,7 @@
 import torch
 from omegaconf import OmegaConf
-import struct
 import argparse
-from gguf import GGUFWriter, GGMLQuantizationType
+from gguf import GGUFWriter
 from pathlib import Path
 
 parser = argparse.ArgumentParser()

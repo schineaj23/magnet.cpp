@@ -357,7 +357,7 @@ ggml_tensor* layer_norm_forward(ggml_context* ctx, ggml_tensor* w, ggml_tensor* 
 
 // Multi-headed attention (standard)
 // In the future, use Flash Attention algorithm. https://arxiv.org/pdf/2205.14135
-ggml_tensor* multihead_attn_forward(ggml_context* ctx, ggml_tensor* k, ggml_tensor* q, ggml_tensor* v, ggml_tensor* x, int32_t num_heads, bool cross_attn)
+ggml_tensor* multihead_attn_forward(ggml_context* ctx, ggml_tensor* k, ggml_tensor* q, ggml_tensor* v, ggml_tensor* x, int32_t num_heads, bool cross_attn = false)
 {
     return nullptr;
 }
@@ -391,7 +391,7 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
     {
         // Forward Linear of projected weights
         struct ggml_tensor* projected = magnet_linear_forward(ctx, x, block->self_attn_in_proj_w);
-        x = ggml_cont(ctx, ggml_transpose(ctx, x));
+        projected = ggml_cont(ctx, ggml_transpose(ctx, projected));
         printf("After forward pass: ");
         PRINT_SHAPE(projected);
 
@@ -405,6 +405,8 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
         printf("embed_dim: %d, n_heads: %d, head_dim: %d, n_kv: %d, n_head_kv: %d, n_batch: %d\n", embed_dim, n_heads, head_dim, n_kv, n_head_kv, n_batch);
         printf("nelements(projected): %d, expected nelements(q): %d\n", ggml_nelements(projected), head_dim * n_batch * n_heads);
         // k, q, v are all packed into the output here. k offset = 0, q = embed_dim (1024)
+        
+        projected = ggml_cast(ctx, projected, GGML_TYPE_F16);
 
         struct ggml_tensor* q = ggml_view_1d(ctx, projected, head_dim * n_batch * n_heads, 0);
         q = ggml_reshape_3d(ctx, q, head_dim, n_batch, n_heads);
@@ -420,21 +422,22 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
         v = ggml_reshape_3d(ctx, v, head_dim, n_kv, n_head_kv);
         printf("v: ");
         PRINT_SHAPE(v);
-
+        
         // use flash attention op :D
         // FIXME: use mask provided by model input (get this from a magnet_context?)
-        struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, projected->type, n_kv, GGML_PAD(1, GGML_KQ_MASK_PAD));
-        GGML_ASSERT(mask);
+        struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, projected->type, n_kv, 64);
 
-        struct ggml_tensor* self_attn = ggml_flash_attn_ext(ctx, q, k, v, mask, 1, 1); // small: [64, 16, 1, 1]
+        struct ggml_tensor* self_attn = ggml_flash_attn_ext(ctx, q, k, v, mask, 1, 0); // small: [64, 16, 1, 1]
         printf("self_attn output: ");
         PRINT_SHAPE(self_attn);
-
+        
         // then apply the out_proj
         self_attn = ggml_reshape_1d(ctx, self_attn, embed_dim);
         self_attn = magnet_linear_forward(ctx, self_attn, block->self_attn_out_proj_w);
+        self_attn = ggml_transpose(ctx, self_attn);
         printf("self_attn after out_proj linear: ");
         PRINT_SHAPE(self_attn);
+        
 
         x = ggml_add(ctx, x, self_attn);
     }
@@ -533,7 +536,7 @@ int main(int argc, char** argv)
     magnet_context* magnet_ctx = new magnet_context();
     magnet_ctx->model = magnet_model();
 
-    std::string file_name = "C:\\Users\\drew\\project\\magnet.cpp\\mdl\\small\\ggml_model.bin";
+    std::string file_name = "/home/cat/src/magnet.cpp/mdl/small/ggml_model.bin";
     if (!load_parameters(file_name, magnet_ctx->model)) {
         fprintf(stderr, "%s: Failed to load model parameters\n", __func__);
         return -1;
@@ -551,7 +554,15 @@ int main(int argc, char** argv)
     ggml_gallocr_alloc_graph(magnet_ctx->galloc, graph);
     ggml_graph_print(graph);
 
-    ggml_backend_graph_compute(model.backend, graph);
+    if(ggml_backend_graph_compute(model.backend, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: ggml_backend_graph_compute() failed\n", __func__);
+        ggml_free(magnet_ctx->model.ctx);
+        ggml_backend_free(model.backend);
+        ggml_gallocr_free(magnet_ctx->galloc);
+        delete magnet_ctx;
+        return -1;
+    }
+        
     auto out = graph->nodes[graph->n_nodes - 1];
     print_tensor(out);
 
