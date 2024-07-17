@@ -405,7 +405,8 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
         printf("embed_dim: %d, n_heads: %d, head_dim: %d, n_kv: %d, n_head_kv: %d, n_batch: %d\n", embed_dim, n_heads, head_dim, n_kv, n_head_kv, n_batch);
         printf("nelements(projected): %d, expected nelements(q): %d\n", ggml_nelements(projected), head_dim * n_batch * n_heads);
         // k, q, v are all packed into the output here. k offset = 0, q = embed_dim (1024)
-        
+
+        // NOTE: in order to use self_attn on CPU, must be of type F16 due to bug in GGML, no to_float function to convert q,k,v tensors
         projected = ggml_cast(ctx, projected, GGML_TYPE_F16);
 
         struct ggml_tensor* q = ggml_view_1d(ctx, projected, head_dim * n_batch * n_heads, 0);
@@ -442,6 +443,9 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
     }
 
     // 2.3) Cross attn normalization (LayerNorm). This is done with the provided conditions
+    {
+        x = layer_norm_forward(ctx, block->norm_cross_w, block->norm_cross_b, x);
+    }
     // 2.4) Cross attention
     // 2.5) Feedforward block (linears)
     // 2.6) Normalize (LayerNorm)
