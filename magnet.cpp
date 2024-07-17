@@ -348,18 +348,11 @@ bool load_parameters(std::string& file_name, magnet_model& model)
 #define PRINT_SHAPE(tensor) printf("(%d, %d, %d, %d)\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
 
 // 2.1) Normalize (LayerNorm https://arxiv.org/pdf/1607.06450)
-ggml_tensor* layer_norm_forward(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x)
+ggml_tensor* magnet_layer_norm_forward(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x)
 {
     // layer_norm = ((x - mean) / sqrt(variance(x))) * weight + bias
     // use oneliner instead
     return ggml_add_inplace(ctx, ggml_mul_inplace(ctx, ggml_norm_inplace(ctx, x, 1e-5), w), b);
-}
-
-// Multi-headed attention (standard)
-// In the future, use Flash Attention algorithm. https://arxiv.org/pdf/2205.14135
-ggml_tensor* multihead_attn_forward(ggml_context* ctx, ggml_tensor* k, ggml_tensor* q, ggml_tensor* v, ggml_tensor* x, int32_t num_heads, bool cross_attn = false)
-{
-    return nullptr;
 }
 
 // Linear transformation layer
@@ -381,11 +374,13 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
     // shape is B, T, C. normalize along dimension 1 (T)
 
     // Make the correct shape for the layer norm (only care about normalizing the T layers)
-    x = ggml_cont(ctx, ggml_transpose(ctx, x));
+    {
+        x = ggml_cont(ctx, ggml_transpose(ctx, x));
 
-    x = layer_norm_forward(ctx, block->layer_norm1_w, block->layer_norm1_b, x);
-    printf("After first layernorm: ");
-    PRINT_SHAPE(x);
+        x = magnet_layer_norm_forward(ctx, block->layer_norm1_w, block->layer_norm1_b, x);
+        printf("After first layernorm: ");
+        PRINT_SHAPE(x);
+    }
 
     // 2.2) Self attention (use Flash Attention, see paper https://arxiv.org/abs/2205.14135)
     {
@@ -423,7 +418,7 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
         v = ggml_reshape_3d(ctx, v, head_dim, n_kv, n_head_kv);
         printf("v: ");
         PRINT_SHAPE(v);
-        
+
         // use flash attention op :D
         // FIXME: use mask provided by model input (get this from a magnet_context?)
         struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, projected->type, n_kv, 64);
@@ -431,7 +426,7 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
         struct ggml_tensor* self_attn = ggml_flash_attn_ext(ctx, q, k, v, mask, 1, 0); // small: [64, 16, 1, 1]
         printf("self_attn output: ");
         PRINT_SHAPE(self_attn);
-        
+
         // then apply the out_proj
         self_attn = ggml_reshape_1d(ctx, self_attn, embed_dim);
         self_attn = magnet_linear_forward(ctx, self_attn, block->self_attn_out_proj_w);
@@ -444,7 +439,7 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
 
     // 2.3) Cross attn normalization (LayerNorm). This is done with the provided conditions
     {
-        x = layer_norm_forward(ctx, block->norm_cross_w, block->norm_cross_b, x);
+        x = magnet_layer_norm_forward(ctx, block->norm_cross_w, block->norm_cross_b, x);
     }
     // 2.4) Cross attention
     // 2.5) Feedforward block (linears)
@@ -525,7 +520,7 @@ ggml_cgraph* build_graph(magnet_model& model, struct ggml_tallocr* allocr)
     }
 
     // FIXME: implement other modules, starting with layernorm to make sure stuff works
-    // struct ggml_tensor* result = layer_norm_forward(ctx0, w, b, input);
+    // struct ggml_tensor* result = magnet_layer_norm_forward(ctx0, w, b, input);
     struct ggml_tensor* result = magnet_transformer_forward(&model, ctx0, allocr, input);
 
     ggml_build_forward_expand(gf, result);
@@ -536,10 +531,16 @@ ggml_cgraph* build_graph(magnet_model& model, struct ggml_tallocr* allocr)
 
 int main(int argc, char** argv)
 {
+    std::string file_name = "/home/cat/src/magnet.cpp/mdl/small/ggml_model.bin";
+    if (argc != 2) {
+        fprintf(stderr, "%s: File path argument not provided\n", __func__);
+        return -1;
+    }
+    file_name = std::string(argv[1]);
+
     magnet_context* magnet_ctx = new magnet_context();
     magnet_ctx->model = magnet_model();
 
-    std::string file_name = "/home/cat/src/magnet.cpp/mdl/small/ggml_model.bin";
     if (!load_parameters(file_name, magnet_ctx->model)) {
         fprintf(stderr, "%s: Failed to load model parameters\n", __func__);
         return -1;
@@ -557,7 +558,7 @@ int main(int argc, char** argv)
     ggml_gallocr_alloc_graph(magnet_ctx->galloc, graph);
     ggml_graph_print(graph);
 
-    if(ggml_backend_graph_compute(model.backend, graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(model.backend, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: ggml_backend_graph_compute() failed\n", __func__);
         ggml_free(magnet_ctx->model.ctx);
         ggml_backend_free(model.backend);
@@ -565,7 +566,7 @@ int main(int argc, char** argv)
         delete magnet_ctx;
         return -1;
     }
-        
+
     auto out = graph->nodes[graph->n_nodes - 1];
     print_tensor(out);
 
