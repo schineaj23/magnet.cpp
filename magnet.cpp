@@ -345,14 +345,18 @@ bool load_parameters(std::string& file_name, magnet_model& model)
     return true;
 }
 
-#define PRINT_SHAPE(tensor) printf("(%d, %d, %d, %d)\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+#define PRINT_SHAPE(comment, tensor) printf("%s: (%d, %d, %d, %d)\n", comment, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
 
 // 2.1) Normalize (LayerNorm https://arxiv.org/pdf/1607.06450)
+// Input shape should be of (*, N) where N is the shape of the weight, output is (*, N) (same shape)
 ggml_tensor* magnet_layer_norm_forward(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x)
 {
     // layer_norm = ((x - mean) / sqrt(variance(x))) * weight + bias
-    // use oneliner instead
-    return ggml_add_inplace(ctx, ggml_mul_inplace(ctx, ggml_norm_inplace(ctx, x, 1e-5), w), b);
+    // The ggml_norm operation computes the norm without applying weight & bias
+    // Reshape the weight and bias to apply over the last dimension
+    ggml_tensor* reshaped_w = ggml_reshape_3d(ctx, w, 1, 1, w->ne[0]);
+    ggml_tensor* reshaped_b = ggml_reshape_3d(ctx, b, 1, 1, b->ne[0]);
+    return ggml_add(ctx, ggml_mul(ctx, ggml_norm_inplace(ctx, x, 1e-5), reshaped_w), reshaped_b);
 }
 
 // Linear transformation layer
