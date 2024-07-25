@@ -354,12 +354,14 @@ ggml_tensor* magnet_layer_norm_forward(ggml_context* ctx, ggml_tensor* w, ggml_t
     // layer_norm = ((x - mean) / sqrt(variance(x))) * weight + bias
     // The ggml_norm operation computes the norm without applying weight & bias
     // Reshape the weight and bias to apply over the last dimension
-    ggml_tensor* reshaped_w = ggml_reshape_3d(ctx, w, 1, 1, w->ne[0]);
-    ggml_tensor* reshaped_b = ggml_reshape_3d(ctx, b, 1, 1, b->ne[0]);
-    return ggml_add(ctx, ggml_mul(ctx, ggml_norm_inplace(ctx, x, 1e-5), reshaped_w), reshaped_b);
+    GGML_ASSERT(ggml_n_dims(x) == 2); // for current use case only work on 2 dimensional tensors
+    ggml_tensor* reshaped_w = ggml_reshape_2d(ctx, w, 1, w->ne[0]);
+    ggml_tensor* reshaped_b = ggml_reshape_2d(ctx, b, 1, b->ne[0]);
+    return ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, 1e-5), reshaped_w), reshaped_b);
 }
 
 // Linear transformation layer
+// Input shape: (*, Hin) Output shape: (*, Hout) where Hin is input features, Hout is output features
 ggml_tensor* magnet_linear_forward(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b = nullptr)
 {
     ggml_tensor* out = ggml_mul_mat(ctx, x, w);
