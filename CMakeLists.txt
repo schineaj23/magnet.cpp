@@ -3,6 +3,7 @@ project("magnet" C CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+set(CMAKE_CXX_STANDARD 20)
 
 set(MAGNET_LIB magnet)
 
@@ -26,3 +27,9 @@ endif()
 if (GGML_METAL)
     add_compile_definitions(GGML_USE_METAL)
 endif()
+
+# Copy the ggml DLL to the output directory (if on windows)
+add_custom_command(TARGET ${MAGNET_LIB} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:ggml>"
+        $<TARGET_FILE_DIR:${MAGNET_LIB}>)
