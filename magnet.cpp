@@ -116,78 +116,77 @@ static void ggml_log_callback_default(ggml_log_level level, const char* text, vo
 #define GGUF_GET_I32(ctx, key) gguf_get_val_i32(ctx, gguf_find_key(ctx, key))
 
 // FIXME: remove this
-#define MAX_ELEMENTS_PER_DIM 100
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX_PRINT_ELEMENTS 10
 
-static float get_value(const struct ggml_tensor* tensor, int64_t idx)
+void print_tensor(struct ggml_tensor* tensor)
 {
-    if (tensor->type == GGML_TYPE_F32) {
-        return ((float*)tensor->data)[idx];
-    } else { // Assuming F16
-        return ggml_fp16_to_fp32(((ggml_fp16_t*)tensor->data)[idx]);
-    }
-}
-
-static void print_value(float value)
-{
-    if (std::isnan(value))
-        printf("nan");
-    else if (std::isinf(value))
-        printf("%sinf", value > 0 ? "" : "-");
-    else
-        printf("%.4f", value);
-}
-
-static void print_dim(const struct ggml_tensor* tensor, int64_t offset, int64_t stride, int64_t size, int indent)
-{
-    printf("%*s[", indent * 2, "");
-    int64_t print_count = MIN(size, MAX_ELEMENTS_PER_DIM);
-
-    for (int64_t i = 0; i < print_count; i++) {
-        if (i == MAX_ELEMENTS_PER_DIM / 2 && size > MAX_ELEMENTS_PER_DIM) {
-            printf("..., ");
-            i = size - MAX_ELEMENTS_PER_DIM / 2 - 1;
-        } else {
-            print_value(get_value(tensor, offset + i * stride));
-            if (i < print_count - 1)
-                printf(", ");
-        }
-    }
-    printf("]");
-}
-
-void print_tensor(const struct ggml_tensor* tensor)
-{
-    if (!tensor || !tensor->data) {
-        printf("Tensor or tensor data is NULL\n");
-        return;
-    }
-
     int n_dims = ggml_n_dims(tensor);
-    printf("Tensor dimensions: ");
-    for (int i = 0; i < n_dims; i++) {
-        printf("%lld", tensor->ne[i]);
-        if (i < n_dims - 1)
-            printf(" x ");
-    }
-    printf("\nTensor type: %s\n", ggml_type_name(tensor->type));
+    int64_t* ne = tensor->ne;
 
-    if (tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_F32) {
-        printf("Warning: This function only prints F16 and F32 tensors correctly.\n");
+    printf("\ntensor(");
+    for (int i = 0; i < n_dims; i++) {
+        printf("%lld%s", ne[i], i < n_dims-1 ? ", " : "");
+    }
+    printf(", type=%s) = ", ggml_type_name(tensor->type));
+
+    if (ggml_nelements(tensor) == 0) {
+        printf("[]\n");
         return;
     }
 
-    printf("tensor(");
-    int64_t offset = 0;
-    int64_t stride = 1;
-    for (int d = 0; d < n_dims; d++) {
-        print_dim(tensor, offset, stride, tensor->ne[d], n_dims - d - 1);
-        if (d < n_dims - 1) {
-            printf(",\n");
-            stride *= tensor->ne[d];
+    int max_per_dim = MAX_PRINT_ELEMENTS;
+    int* indices = (int*)calloc(n_dims, sizeof(int));
+    bool* first_in_dim = (bool*)calloc(n_dims, sizeof(bool));
+    for (int i = 0; i < n_dims; i++) {
+        first_in_dim[i] = true;
+    }
+    int depth = 0;
+
+    while (depth >= 0) {
+        if (depth == n_dims) {
+            int64_t idx = 0;
+            int64_t mult = 1;
+            for (int i = 0; i < n_dims; i++) {
+                idx += indices[i] * mult;
+                mult *= ne[i];
+            }
+            if (!first_in_dim[depth - 1]) {
+                printf(", ");
+            }
+            printf("%.4f", ggml_get_f32_1d(tensor, idx));
+            first_in_dim[depth - 1] = false;
+
+            depth--;
+            indices[depth]++;
+        } else if (indices[depth] < ne[depth] && (indices[depth] < max_per_dim || indices[depth] >= ne[depth] - max_per_dim)) {
+            if (indices[depth] == 0) {
+                if (!first_in_dim[depth]) {
+                    printf(",\n");
+                    for (int i = 0; i < depth; i++)
+                        printf(" ");
+                }
+                printf("[");
+                first_in_dim[depth] = true;
+            }
+            depth++;
+        } else {
+            if (indices[depth] > 0) {
+                if (ne[depth] > 2 * max_per_dim) {
+                    printf(", ...");
+                }
+                printf("]");
+            }
+            first_in_dim[depth] = false;
+            indices[depth] = 0;
+            depth--;
+            if (depth >= 0)
+                indices[depth]++;
         }
     }
-    printf(")\n");
+    printf("\n");
+
+    free(indices);
+    free(first_in_dim);
 }
 
 bool load_parameters(std::string& file_name, magnet_model& model)
