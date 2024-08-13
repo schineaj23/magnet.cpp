@@ -418,18 +418,14 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
         // k, q, v are all packed into the output here. k offset = 0, q = embed_dim (1024)
 
         auto seq_len = projected->ne[0];
-        // printf("element size: %d\n", ggml_element_size(projected));
-
-        // FIXME: Slice correctly, for some reason get different results than torch tests.
-        // nb[1] stride works correctly for the offset 0 case, but offsets of k & v are incorrect
-        // my theory is that projected is a different memory layout than I previously thought
         struct ggml_tensor* q = ggml_view_2d(ctx, projected, seq_len, embed_dim, projected->nb[1], 0);
-        struct ggml_tensor* k = ggml_view_2d(ctx, projected, seq_len, embed_dim, projected->nb[1], embed_dim * ggml_element_size(projected)); // projected[:, :embed_dim]
-        struct ggml_tensor* v = ggml_view_2d(ctx, projected, seq_len, embed_dim, projected->nb[1], 2 * embed_dim * ggml_element_size(projected)); // projected[:, :embed_dim]
+        GGML_ASSERT(3 * embed_dim == 3072);
+        struct ggml_tensor* k = ggml_view_2d(ctx, projected, seq_len, embed_dim, projected->nb[1], projected->nb[1] * embed_dim); // projected[:, :embed_dim]
+        struct ggml_tensor* v = ggml_view_2d(ctx, projected, seq_len, embed_dim, projected->nb[1], projected->nb[1] * 2 * embed_dim); // projected[:, :embed_dim]
 
         q = ggml_reshape_3d(ctx, q, head_dim, seq_len, n_heads);
-        v = ggml_reshape_3d(ctx, v, head_dim, seq_len, n_head_kv);
         k = ggml_reshape_3d(ctx, k, head_dim, seq_len, n_head_kv);
+        v = ggml_reshape_3d(ctx, v, head_dim, seq_len, n_head_kv);
 
         // NOTE: in order to use self_attn on CPU, must be of type F16 due to bug in GGML, no to_float function to convert q,k,v tensors
         if (ggml_backend_is_cpu(model->backend)) {
