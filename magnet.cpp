@@ -376,7 +376,7 @@ ggml_tensor* magnet_linear_forward(ggml_context* ctx, ggml_tensor* x, ggml_tenso
     return out;
 }
 
-// Scaled Dot-Product Attention 
+// Scaled Dot-Product Attention
 // Attention(Q, K, V) = softmax( (Q * K^T)/sqrt(dk) ) * V
 ggml_tensor* magnet_dp_attn_forward(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v)
 {
@@ -384,7 +384,7 @@ ggml_tensor* magnet_dp_attn_forward(ggml_context* ctx, ggml_tensor* q, ggml_tens
     auto scale = 1.0f / sqrtf(k->ne[1]);
     struct ggml_tensor* x = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, q)), ggml_cont(ctx, ggml_transpose(ctx, k))); // Q*K^T. Tech debt from loading transpoed weights
     x = ggml_scale(ctx, x, scale);
-    x = ggml_soft_max(ctx, x); 
+    x = ggml_soft_max(ctx, x);
     x = ggml_mul_mat(ctx, x, v);
     return x;
 }
@@ -425,7 +425,7 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
         projected = ggml_cont(ctx, projected);
 
         // printf("embed_dim: %d, n_heads: %d, head_dim: %d, n_kv: %d, n_head_kv: %d, n_batch: %d\n", embed_dim, n_heads, head_dim, n_kv, n_head_kv, n_batch);
-        // Unstack K, Q, V from projected 
+        // Unstack K, Q, V from projected
         auto seq_len = projected->ne[0];
         struct ggml_tensor* q = ggml_view_2d(ctx, projected, seq_len, embed_dim, projected->nb[1], 0);
         struct ggml_tensor* k = ggml_view_2d(ctx, projected, seq_len, embed_dim, projected->nb[1], projected->nb[1] * embed_dim); // projected[:, :embed_dim]
