@@ -4,11 +4,15 @@ from torch.nn import functional as F
 import sys
 import math
 
-state = torch.load("./assets/small/state_dict.bin")
+state = torch.load("./assets/small/weight/state_dict.bin")
 weights = state["best_state"]
 seq = torch.ones((4, 1024))
 print(seq)
 x = seq
+
+emb = weights["emb.0.weight"].to(torch.float32)
+res = F.embedding(torch.ones(1, 4, 5).to(torch.float32).type(torch.LongTensor), emb)
+print("res", res, res.shape)
 
 n_w = weights["transformer.layers.0.norm1.weight"].to(torch.float32)
 n_b = weights["transformer.layers.0.norm1.bias"].to(torch.float32)

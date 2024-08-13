@@ -416,15 +416,8 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
 
     // 2.2) Self attention (use Flash Attention, see paper https://arxiv.org/abs/2205.14135)
     {
-        if (ggml_backend_is_cpu(model->backend)) {
-            block->self_attn_in_proj_w = ggml_cast(ctx, block->self_attn_in_proj_w, GGML_TYPE_F32);
-            block->self_attn_out_proj_w = ggml_cast(ctx, block->self_attn_out_proj_w, GGML_TYPE_F32);
-        }
-
         struct ggml_tensor* projected = magnet_linear_forward(ctx, x, block->self_attn_in_proj_w);
-        projected = ggml_cont(ctx, projected);
 
-        // printf("embed_dim: %d, n_heads: %d, head_dim: %d, n_kv: %d, n_head_kv: %d, n_batch: %d\n", embed_dim, n_heads, head_dim, n_kv, n_head_kv, n_batch);
         // Unstack K, Q, V from projected
         auto seq_len = projected->ne[0];
         struct ggml_tensor* q = ggml_view_2d(ctx, projected, seq_len, embed_dim, projected->nb[1], 0);
@@ -470,11 +463,6 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
     // 2.4) Cross attention
     {
         auto seq_len = x->ne[0];
-
-        if (ggml_backend_is_cpu(model->backend)) {
-            block->cross_attn_in_proj_w = ggml_cast(ctx, block->cross_attn_in_proj_w, GGML_TYPE_F32);
-            block->cross_attn_out_proj_w = ggml_cast(ctx, block->cross_attn_out_proj_w, GGML_TYPE_F32);
-        }
 
         GGML_ASSERT(cross_attn_src->ne[0] == seq_len);
         GGML_ASSERT(cross_attn_src->ne[1] == embed_dim);
@@ -531,11 +519,6 @@ ggml_tensor* magnet_transformer_block_forward(magnet_model* model, ggml_context*
 
     // 2.6) Feedforward block (linears)
     {
-        if (ggml_backend_is_cpu(model->backend)) {
-            block->linear1_w = ggml_cast(ctx, block->linear1_w, GGML_TYPE_F32);
-            block->linear2_w = ggml_cast(ctx, block->linear2_w, GGML_TYPE_F32);
-        }
-
         struct ggml_tensor* x_p = magnet_linear_forward(ctx, x, block->linear1_w);
         x_p = ggml_gelu(ctx, x_p);
         x_p = magnet_linear_forward(ctx, x_p, block->linear2_w);
@@ -561,15 +544,43 @@ void magnet_positional_encoding(struct ggml_tensor* dst, const struct ggml_tenso
     }
 }
 
+void magnet_embedding(struct ggml_tensor* dst, const struct ggml_tensor* src, const struct ggml_tensor* emb, int ith, int nth, void* userdata)
+{
+    GGML_ASSERT(emb->type == GGML_TYPE_F32);
+    PRINT_SHAPE("magnet_embedding: emb", emb);
+
+    auto B = src->ne[0];
+    auto K = src->ne[1];
+    auto S = src->ne[2];
+
+    for(int b = 0;b<B;b++) {
+        for(int k = 0;k<K;k++) {
+            for(int s=0;s<S;s++) {
+                // get the token id for particular token in sequence (this is the index of the embedding vector)
+                int token_id = (int)*(float*)((char*)src->data + (s * src->nb[2] + k * src->nb[1] + b * src->nb[0]));
+                // get the pointer to the position in the embedding weights where the vector for the index starts
+                float* src_embedding = (float*)((char*)emb->data + token_id * emb->nb[1]);
+                // get the pointer to the position in dst tensor where the emb vector will start
+                float* dst_embedding = (float*)((char*)dst->data + (s * dst->nb[2] + k * dst->nb[1] + b * dst->nb[0]));
+
+                // now copy the embedding vector to its corresponding position in the dst tensor
+                for(int e = 0;e<emb->ne[0];e++) {
+                    *(float*)((char*)dst_embedding + e * dst->nb[3]) = *(float*)((char*)src_embedding + e * emb->nb[0]);
+                }
+            }
+        }
+    }
+}
+
 ggml_tensor* magnet_transformer_forward(magnet_model* model, ggml_context* ctx, ggml_tallocr* alloc, ggml_tensor* x, ggml_tensor* cross_attn_src)
 {
-    // Expected shape (B, K, S)
+    // Expected shape (B, T, C)
     // FIXME: remove the batch_size dimension
     auto batch_size = x->ne[0];
     auto tokens = x->ne[1];
     auto channels = x->ne[2];
 
-    // 1) Create position embeddings (MAGNeT uses sine embeddings)
+    // 1) Create position encodings (MAGNeT uses sine encodings)
     // FIXME: remove batch size
     ggml_tensor* positions = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, batch_size, tokens, channels);
     ggml_tallocr_alloc(alloc, positions);
@@ -586,16 +597,23 @@ ggml_tensor* magnet_transformer_forward(magnet_model* model, ggml_context* ctx, 
     auto& blocks = model->transformer.transformer_blocks;
     for (int i = 0; i < blocks.size(); i++) {
         GGML_ASSERT(blocks[i].linear1_w);
-        printf("i = %d\n", i);
         x = magnet_transformer_block_forward(model, ctx, &blocks[i], x, cross_attn_src);
     }
 
     return x;
 }
 
+ggml_tensor* magnet_forward(magnet_model* model, ggml_context* context, ggml_tallocr* alloc, ggml_tensor* x)
+{
+    // Expected shape (B, K, S)
+    auto batch_size = x->ne[0];
+    auto codebooks = x->ne[1]; // Redundant since n_q is a hparam
+    auto seq_len = x->ne[2];
+}
+
 ggml_cgraph* build_graph(magnet_model& model, struct ggml_tallocr* allocr)
 {
-    static size_t buf_size = ggml_tensor_overhead() * 100000 + ggml_graph_overhead() + (1024 * 1024 * 1024);
+    static size_t buf_size = ggml_tensor_overhead() * 1000000 + ggml_graph_overhead() + (1024 * 1024 * 1024);
     static std::vector<uint8_t> buf(buf_size);
 
     // create dummy context
@@ -608,11 +626,12 @@ ggml_cgraph* build_graph(magnet_model& model, struct ggml_tallocr* allocr)
     // create temporary context to build the grpah
     struct ggml_context* ctx0 = ggml_init(params0);
 
-    struct ggml_cgraph* gf = ggml_new_graph(ctx0);
+    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 3072, false);
 
     // The transformer expects S, E (sequence len, embed_dim)
     // total forward expects (T, C) (tokens, channels) not there yet
-    struct ggml_tensor* input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 4, model.hparams.dim);
+    //struct ggml_tensor* input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 4, model.hparams.dim);
+    struct ggml_tensor* input = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, 4, 5, 1024);
     struct ggml_tensor* cross_attn_src = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 4, model.hparams.dim);
     ggml_tallocr_alloc(allocr, input);
     ggml_tallocr_alloc(allocr, cross_attn_src);
@@ -620,13 +639,8 @@ ggml_cgraph* build_graph(magnet_model& model, struct ggml_tallocr* allocr)
     input = ggml_set_f32(input, 1.0f);
     cross_attn_src = ggml_set_f32(cross_attn_src, 1.0f);
 
-    if (ggml_backend_is_cpu(model.backend)) {
-        model.transformer.transformer_blocks[0].layer_norm1_w = ggml_cast(ctx0, model.transformer.transformer_blocks[0].layer_norm1_w, GGML_TYPE_F32);
-        model.transformer.transformer_blocks[0].layer_norm1_b = ggml_cast(ctx0, model.transformer.transformer_blocks[0].layer_norm1_b, GGML_TYPE_F32);
-    }
-
-    struct ggml_tensor* result = magnet_transformer_block_forward(&model, ctx0, &model.transformer.transformer_blocks[0], input, cross_attn_src);
-    // struct ggml_tensor* result = magnet_transformer_forward(&model, ctx0, allocr, input, cross_attn_src);
+    //struct ggml_tensor* result = magnet_transformer_forward(&model, ctx0, allocr, input, cross_attn_src);
+    struct ggml_tensor* result = ggml_map_custom2(ctx0, input, ggml_cast(ctx0, model.embed0_w, GGML_TYPE_F32), magnet_embedding, 1, NULL);
 
     ggml_build_forward_expand(gf, result);
 
@@ -673,6 +687,9 @@ int main(int argc, char** argv)
     }
 
     auto out = graph->nodes[graph->n_nodes - 1];
+    
+    printf("\n\nemb tensor:");
+    print_tensor(graph->leafs[1]);
 
     printf("\n\nout tensor:");
     print_tensor(out);
