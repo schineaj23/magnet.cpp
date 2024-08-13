@@ -2,6 +2,7 @@
 import torch
 from torch.nn import functional as F
 import sys
+import math
 
 state = torch.load("./assets/small/state_dict.bin")
 weights = state["best_state"]
@@ -74,6 +75,7 @@ print("expected attention", expected_attn, expected_attn.shape)
 
 
 x = x + expected_attn
+print("after all self_attn (x + expected_attn)", x, x.shape)
 
 # cross attn normalization
 crn_w = weights["transformer.layers.0.norm_cross.weight"].to(torch.float32)
@@ -133,11 +135,14 @@ cross_attn_expected, _ = F.multi_head_attention_forward(
 print("cross_attn_expected", cross_attn_expected, cross_attn_expected.shape)
 
 x = x + cross_attn_expected
+print("after all cross_attn (x + cross_attn_expected)", x, x.shape)
 
-n_w = weights["transformer.layers.0.norm2.weight"].to(torch.float32)
-n_b = weights["transformer.layers.0.norm2.bias"].to(torch.float32)
+n_w2 = weights["transformer.layers.0.norm2.weight"].to(torch.float32)
+print("n_w2", n_w2, n_w2.shape)
+n_b2 = weights["transformer.layers.0.norm2.bias"].to(torch.float32)
+print("n_b2", n_b2, n_b2.shape)
 
-x = F.layer_norm(x, n_w.shape, n_w, n_b)
+x = F.layer_norm(x, n_w2.shape, n_w2, n_b2)
 print("x after second layernorm", x, x.shape)
 
 linear1_w = weights["transformer.layers.0.linear1.weight"].to(torch.float32)
@@ -146,6 +151,7 @@ linear2_w = weights["transformer.layers.0.linear2.weight"].to(torch.float32)
 x_p = F.linear(x, linear1_w)
 x_p = F.gelu(x_p)
 x_p = F.linear(x_p, linear2_w)
+print("x_p after linear layers", x_p, x_p.shape)
 
 x = x + x_p
 print("x after linear layers", x, x.shape)
