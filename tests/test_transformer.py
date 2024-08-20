@@ -10,9 +10,28 @@ seq = torch.ones((4, 1024))
 print(seq)
 x = seq
 
+_x = torch.ones(1, 4, 5).to(torch.float32).type(torch.LongTensor)
+for i in range(4):
+    _x[:,i] = (i+1) * _x[:, i]
+print("_x", x, x.shape)
+
+print("_x[:, 0]", _x[:, 0], _x[:, 0].shape)
+print("_x[:, 1]", _x[:, 1], _x[:, 1].shape)
+print("_x[:, 1]", _x[:, 2], _x[:, 2].shape)
+print("_x[:, 1]", _x[:, 3], _x[:, 3].shape)
 emb = weights["emb.0.weight"].to(torch.float32)
-res = F.embedding(torch.ones(1, 4, 5).to(torch.float32).type(torch.LongTensor), emb)
+res = F.embedding(_x[:, 0], emb)
+
+emb = weights["emb.1.weight"].to(torch.float32)
+res = res + F.embedding(_x[:, 1], emb)
+
+emb = weights["emb.2.weight"].to(torch.float32)
+res = res + F.embedding(_x[:, 2], emb)
+
+emb = weights["emb.3.weight"].to(torch.float32)
+res = res + F.embedding(_x[:, 3], emb)
 print("res", res, res.shape)
+sys.exit(0)
 
 n_w = weights["transformer.layers.0.norm1.weight"].to(torch.float32)
 n_b = weights["transformer.layers.0.norm1.bias"].to(torch.float32)
